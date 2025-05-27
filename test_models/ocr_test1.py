@@ -241,6 +241,14 @@ def parse_tflite_out(interp, od: List[Dict], thr: float, names: Sequence[str],
 CLASS_NAMES = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
+def flush_cache():
+    """Очищення кешу моделей та збірка сміття."""
+    global MODEL_CACHE
+    MODEL_CACHE.clear()
+    gc.collect()
+    logger.info("Model cache flushed and garbage collected")
+
+
 def preprocess(img: np.ndarray, inp_details: List[Dict], img_size: int) -> np.ndarray:
     """Попередня обробка зображення з покращеною обробкою помилок."""
     try:
@@ -330,18 +338,97 @@ def load_names(pt_path: Optional[str]) -> List[str]:
     return CLASS_NAMES
 
 
-def flush_cache():
-    """Очищення кешу моделей та збірка сміття."""
-    global MODEL_CACHE
-    MODEL_CACHE.clear()
-    gc.collect()
-    logger.info("Model cache flushed and garbage collected")
+def select_most_consistent_result(all_detections: List[List[Tuple[float, str, float]]]) -> List[
+    Tuple[float, str, float]]:
+    """Вибирає найбільш консистентний результат з декількох запусків."""
+    if not all_detections or not any(all_detections):
+        return []
+
+    try:
+        # Convert detections to strings for comparison
+        detection_strings = []
+        detection_confidences = []
+
+        for detections in all_detections:
+            if detections:
+                plate_str, avg_conf = order_string(detections)
+                detection_strings.append(plate_str)
+                detection_confidences.append((detections, avg_conf))
+            else:
+                detection_strings.append("")
+                detection_confidences.append(([], 0.0))
+
+        if not detection_strings:
+            return []
+
+        # Count occurrences of each result
+        from collections import Counter
+        string_counts = Counter(detection_strings)
+
+        # Find most common non-empty result
+        most_common = string_counts.most_common()
+        best_result = None
+        best_confidence = 0.0
+
+        for result_str, count in most_common:
+            if result_str and result_str not in ["НЕ РОЗПІЗНАНО", "ПОМИЛКА"]:
+                # Find the detection with highest confidence for this string
+                for detections, conf in detection_confidences:
+                    current_str, _ = order_string(detections)
+                    if current_str == result_str and conf > best_confidence:
+                        best_result = detections
+                        best_confidence = conf
+                break
+
+        # If no good result found, use the one with highest confidence
+        if best_result is None:
+            best_confidence = 0.0
+            for detections, conf in detection_confidences:
+                if conf > best_confidence:
+                    best_result = detections
+                    best_confidence = conf
+
+        return best_result or []
+
+    except Exception as e:
+        logger.warning(f"Error in consistency selection: {e}")
+        # Return first non-empty result as fallback
+        for detections in all_detections:
+            if detections:
+                return detections
+        return []
+
+
+def set_deterministic_behavior():
+    """Встановлює детермінований режим для всіх можливих бібліотек."""
+    try:
+        # Set numpy random seed for reproducibility
+        np.random.seed(42)
+
+        # Try to set TensorFlow deterministic behavior
+        try:
+            import tensorflow as tf
+            # Set TF to be deterministic
+            tf.config.threading.set_inter_op_parallelism_threads(1)
+            tf.config.threading.set_intra_op_parallelism_threads(1)
+            # Set random seeds
+            tf.random.set_seed(42)
+        except ImportError:
+            pass
+
+        # Set environment variables for deterministic behavior
+        os.environ["TF_DETERMINISTIC_OPS"] = "1"
+        os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+        os.environ["PYTHONHASHSEED"] = "42"
+
+    except Exception as e:
+        logger.warning(f"Could not set deterministic behavior: {e}")
 
 
 # ─────────── Enhanced backends ─────────────────────────────────────────────
 def run_pt_or_onnx(path: str, img: np.ndarray, names: List[str],
                    threshold: float, runs: int) -> Tuple[str, float, float]:
-    """Запуск PT/ONNX моделей з кешуванням та обробкою помилок."""
+    """Запуск PT/ONNX моделей з кешуванням та детермінованою поведінкою."""
     try:
         # Check cache first
         if path in MODEL_CACHE:
@@ -351,11 +438,12 @@ def run_pt_or_onnx(path: str, img: np.ndarray, names: List[str],
             model = YOLO(path)
             MODEL_CACHE[path] = model
 
-        # Warmup run
-        _ = model(img, verbose=False, conf=threshold)
+        # Multiple warmup runs for stability
+        for _ in range(3):
+            _ = model(img, verbose=False, conf=threshold)
 
         times = []
-        detections = []
+        all_detections = []
 
         for i in range(runs):
             try:
@@ -364,8 +452,9 @@ def run_pt_or_onnx(path: str, img: np.ndarray, names: List[str],
                 elapsed_time = time.perf_counter() - start_time
                 times.append(elapsed_time)
 
-                # Process results on last run
-                if i == runs - 1 and results.boxes is not None:
+                # Collect detections from all runs
+                current_detections = []
+                if results.boxes is not None:
                     for box in results.boxes:
                         try:
                             conf = float(box.conf.squeeze())
@@ -375,18 +464,23 @@ def run_pt_or_onnx(path: str, img: np.ndarray, names: List[str],
                                 continue
 
                             x_center = float(box.xywh.squeeze()[0])
-                            detections.append((x_center, names[class_id], conf))
+                            current_detections.append((x_center, names[class_id], conf))
 
                         except Exception as e:
                             logger.warning(f"Error processing box: {e}")
                             continue
 
+                all_detections.append(current_detections)
+
             except Exception as e:
                 logger.error(f"Error in inference run {i}: {e}")
-                times.append(0.0)  # Add zero time for failed runs
+                times.append(0.0)
+                all_detections.append([])
                 continue
 
-        plate_str, avg_conf = order_string(detections)
+        # Use most consistent result
+        final_detections = select_most_consistent_result(all_detections)
+        plate_str, avg_conf = order_string(final_detections)
         avg_time = float(np.mean(times)) if times else 0.0
 
         return plate_str, avg_conf, avg_time
@@ -398,60 +492,74 @@ def run_pt_or_onnx(path: str, img: np.ndarray, names: List[str],
 
 def run_litert(path: str, img: np.ndarray, names: List[str], threshold: float,
                runs: int, img_size: int, iou_threshold: float) -> Tuple[str, float, float]:
-    """Запуск LiteRT моделей з покращеною обробкою помилок."""
+    """Запуск LiteRT моделей з детермінованою обробкою."""
     try:
-        # Try different import options for TensorFlow Lite
-        interpreter = None
-        try:
-            from ai_edge_litert.interpreter import Interpreter
-            interpreter = Interpreter(model_path=path)
-        except ImportError:
+        # Check cache first for consistent behavior
+        cache_key = f"{path}_litert"
+        if cache_key in MODEL_CACHE:
+            interpreter = MODEL_CACHE[cache_key]
+        else:
+            # Try different import options for TensorFlow Lite
+            interpreter = None
             try:
-                import tflite_runtime.interpreter as tflite
-                interpreter = tflite.Interpreter(model_path=path)
+                from ai_edge_litert.interpreter import Interpreter
+                interpreter = Interpreter(model_path=path, num_threads=1)  # Single thread for consistency
             except ImportError:
-                import tensorflow as tf
-                interpreter = tf.lite.Interpreter(model_path=path)
+                try:
+                    import tflite_runtime.interpreter as tflite
+                    interpreter = tflite.Interpreter(model_path=path, num_threads=1)
+                except ImportError:
+                    import tensorflow as tf
+                    interpreter = tf.lite.Interpreter(model_path=path, num_threads=1)
 
-        if interpreter is None:
-            raise RuntimeError("No TensorFlow Lite interpreter available")
+            if interpreter is None:
+                raise RuntimeError("No TensorFlow Lite interpreter available")
 
-        interpreter.allocate_tensors()
+            interpreter.allocate_tensors()
+            MODEL_CACHE[cache_key] = interpreter
 
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
 
-        # Preprocess image
+        # Preprocess image once for consistency
         processed_img = preprocess(img, input_details, img_size)
 
-        # Warmup run
-        interpreter.set_tensor(input_details[0]["index"], processed_img)
-        interpreter.invoke()
+        # Multiple warmup runs for stability
+        for _ in range(3):
+            interpreter.set_tensor(input_details[0]["index"], processed_img)
+            interpreter.invoke()
 
         times = []
-        detections = []
+        all_detections = []  # Store all runs for consistency analysis
 
         for i in range(runs):
             try:
                 start_time = time.perf_counter()
+
+                # Reset interpreter state
                 interpreter.set_tensor(input_details[0]["index"], processed_img)
                 interpreter.invoke()
+
                 elapsed_time = time.perf_counter() - start_time
                 times.append(elapsed_time)
 
-                # Process results on last run
-                if i == runs - 1:
-                    detections = parse_tflite_out(
-                        interpreter, output_details, threshold, names,
-                        img_w=img_size, iou_thr=iou_threshold
-                    )
+                # Collect detections from all runs for consistency check
+                current_detections = parse_tflite_out(
+                    interpreter, output_details, threshold, names,
+                    img_w=img_size, iou_thr=iou_threshold
+                )
+                all_detections.append(current_detections)
 
             except Exception as e:
                 logger.error(f"Error in LiteRT run {i}: {e}")
                 times.append(0.0)
+                all_detections.append([])
                 continue
 
-        plate_str, avg_conf = order_string(detections)
+        # Use most consistent result or majority vote
+        final_detections = select_most_consistent_result(all_detections)
+
+        plate_str, avg_conf = order_string(final_detections)
         avg_time = float(np.mean(times)) if times else 0.0
 
         return plate_str, avg_conf, avg_time
@@ -523,6 +631,12 @@ def create_parser() -> argparse.ArgumentParser:
         help="Enable verbose logging"
     )
 
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic mode for consistent results"
+    )
+
     return parser
 
 
@@ -567,6 +681,11 @@ def main():
     # Set logging level
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Enable deterministic behavior if requested
+    if args.deterministic:
+        set_deterministic_behavior()
+        logger.info("Deterministic mode enabled")
 
     # Validate arguments
     if not validate_args(args):
@@ -654,4 +773,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
