@@ -9,7 +9,7 @@ OCR-YOLO tester (PT / ONNX / TFLite-LiteRT)
 
 Використання приклад:
 
-    python3 ocr_test.py --model --image image.png --input_size 320 --conf 0.12 --iou_thr 0.35 --runs 5
+    python3 ocr_test.py --model ocr.pt/onnx/tflite --image image.png --input_size 320 --conf 0.12 --iou_thr 0.35 --runs 5
 
 Залежності: opencv-python, numpy, (tflite_runtime | tensorflow), ultralytics,
 onnxruntime.  Python ≥ 3.8.
