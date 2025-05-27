@@ -6,6 +6,13 @@ OCR-YOLO tester (PT / ONNX / TFLite-LiteRT)
 • Автоматично обробляє три типи TFLite-виходу:
   ① 4-тензорний   ② raw 41-атрибут   ③ post-sigmoid 7-атрибут.
 • 1-D IoU-NMS вздовж X прибирає «стіну нулів».
+
+Використання приклад:
+
+    python3 ocr_test.py --model --image image.png --input_size 320 --conf 0.12 --iou_thr 0.35 --runs 5
+
+Залежності: opencv-python, numpy, (tflite_runtime | tensorflow), ultralytics,
+onnxruntime.  Python ≥ 3.8.
 """
 
 from __future__ import annotations
