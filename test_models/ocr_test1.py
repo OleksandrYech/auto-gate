@@ -16,6 +16,7 @@ OCR-YOLO tester  —  PT / ONNX / TFLite-INT8
         --image test.png --input_size 320 \
         --conf 0.2 --iou_thr 0.35 --runs 10 \
         --no-xnnpack --threads 1 --clear-cache
+        --show-all друкує результат кожного run
 
 Залежності: opencv-python, numpy, ultralytics, onnxruntime,
 tflite-runtime (або tensorflow), Python ≥ 3.8.
@@ -35,19 +36,16 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# ───────────────────────────── TFLite utils ────────────────────────────────
+# ────────────────────────── TFLite helpers ──────────────────────────────
 def _dequant(arr: np.ndarray, det: dict) -> np.ndarray:
-    """Зворотне квантування INT8/UINT8 тензора."""
     if arr.dtype == np.float32:
         return arr
     qp = det["quantization_parameters"]
-    zp = qp["zero_points"]
-    sc = qp["scales"]
+    zp, sc = qp["zero_points"], qp["scales"]
     return (arr.astype(np.float32) - zp) * sc
 
 
 def _iou1d(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    """IoU на прямій."""
     l, r = max(a[0], b[0]), min(a[1], b[1])
     inter = max(0.0, r - l)
     return inter / ((a[1] - a[0]) + (b[1] - b[0]) - inter + 1e-6)
@@ -55,10 +53,9 @@ def _iou1d(a: Tuple[float, float], b: Tuple[float, float]) -> float:
 
 def parse_tflite_out(interp, out_det, thr: float, names: Sequence[str],
                      in_w: int, iou_thr: float) -> List[Tuple[float, str, float]]:
-    """Повертає [(x_center_px, char, conf), …] зі всіх доступних форматів."""
     det_raw: List[Tuple[float, float, str, float]] = []
 
-    # ① 4-тензорний вихід — boxes, scores, classes, n
+    # ① 4-тензорний out
     if len(out_det) == 4 and out_det[0]["shape"][-1] == 4:
         boxes = _dequant(interp.get_tensor(out_det[0]["index"]), out_det[0])[0]
         scores = _dequant(interp.get_tensor(out_det[1]["index"]), out_det[1])[0]
@@ -72,7 +69,7 @@ def parse_tflite_out(interp, out_det, thr: float, names: Sequence[str],
             x1, _, x2, _ = boxes[j]
             det_raw.append((x1, x2, names[cid], cf))
 
-    # ②/③ — один тензор (6, 7 або 41 атрибут)
+    # ②/③ — один тензор ≥6 атрибутів
     else:
         raw = _dequant(interp.get_tensor(out_det[0]["index"]), out_det[0])
         if raw.ndim != 3:
@@ -81,23 +78,21 @@ def parse_tflite_out(interp, out_det, thr: float, names: Sequence[str],
         σ = lambda x: 1 / (1 + math.exp(-x))
 
         for row in raw[0]:
-            if attrs == 6:                       # x1 y1 x2 y2 conf cls
+            # формат 6 attrs (x1 y1 x2 y2 conf cls)
+            if attrs == 6:
                 x1, _, x2, _, cf, cid = row
                 cf, cid = float(cf), int(cid)
                 if cf < thr or cid >= len(names):
                     continue
-
-            else:                                # ≥7 атрибутів
+            else:  # ≥7 атрибутів (YOLO-5/8/11)
                 obj = σ(float(row[4])) if attrs >= 41 else float(row[4])
                 if obj < 1e-6:
                     continue
-
                 cls_logits = row[5:5 + len(names)]
                 cid = int(np.argmax(cls_logits))
                 cf = obj * (σ(float(cls_logits[cid])) if attrs >= 41 else 1.0)
                 if cf < thr or cid >= len(names):
                     continue
-
                 cx, w = float(row[0]) * in_w, float(row[2]) * in_w
                 if w < 2:
                     continue
@@ -108,31 +103,28 @@ def parse_tflite_out(interp, out_det, thr: float, names: Sequence[str],
     if not det_raw:
         return []
 
-    # 1-D IoU-NMS
     det_raw.sort(key=lambda d: d[3], reverse=True)
     keep: List[Tuple[float, float, str, float]] = []
     for cand in det_raw:
         if all(_iou1d((cand[0], cand[1]), (k[0], k[1])) <= iou_thr for k in keep):
             keep.append(cand)
 
-    keep.sort(key=lambda d: (d[0] + d[1]) / 2)       # ліворуч-→праворуч
+    keep.sort(key=lambda d: (d[0] + d[1]) / 2)          # left→right
     return [((k[0] + k[1]) / 2, k[2], k[3]) for k in keep]
 
 
-# ────────────────────────────── helpers ────────────────────────────────────
+# ───────────────────────────── misc ─────────────────────────────────────
 CLASS_NAMES = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
 def preprocess(img: np.ndarray, in_det: List[dict], img_sz: int) -> np.ndarray:
-    """Підготовка зображення (NCHW/NHWC, float32/int8/uint8)."""
     shp, dtype = in_det[0]["shape"], in_det[0]["dtype"]
     nchw = shp[1] == 3
     h = shp[2] if nchw else shp[1] or img_sz
     w = shp[3] if nchw else shp[2] or img_sz
 
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
-    img = img.astype(np.float32) / 255.0
+    img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
     if nchw:
         img = img.transpose(2, 0, 1)
     img = img[None]
@@ -140,12 +132,10 @@ def preprocess(img: np.ndarray, in_det: List[dict], img_sz: int) -> np.ndarray:
     if dtype in (np.int8, np.uint8):
         qp = in_det[0]["quantization_parameters"]
         img = (img / (qp["scales"][0] or 1.0) + qp["zero_points"][0]).astype(dtype)
-
     return img.astype(dtype)
 
 
 def order_string(det: List[Tuple[float, str, float]]) -> Tuple[str, float]:
-    """Сортує символи ліворуч→праворуч, повертає строку та середню впевненість."""
     if not det:
         return "НЕ РОЗПІЗНАНО", 0.0
     det.sort(key=lambda d: d[0])
@@ -154,7 +144,6 @@ def order_string(det: List[Tuple[float, str, float]]) -> Tuple[str, float]:
 
 
 def load_names(pt_path: str | None) -> Sequence[str]:
-    """Читає список класів із .pt-моделі або повертає стандартний."""
     if pt_path:
         try:
             names = YOLO(pt_path).names
@@ -165,30 +154,41 @@ def load_names(pt_path: str | None) -> Sequence[str]:
     return CLASS_NAMES
 
 
-# ───────────────────────────── back-ends ───────────────────────────────────
-def run_pt_or_onnx(path: str, img: np.ndarray, names: Sequence[str],
-                   thr: float, runs: int) -> Tuple[str, float, float]:
+# ───────────────────── back-ends with per-run print ─────────────────────
+def run_pt_or_onnx(path: str, img: np.ndarray, names: Sequence[str], thr: float,
+                   runs: int, show_all: bool) -> Tuple[str, float, float]:
     model = YOLO(path)
-    _ = model(img, verbose=False, conf=thr)           # прогрів
-    times, det = [], []
+    _ = model(img, verbose=False, conf=thr)              # warm-up
 
+    times, det_final = [], []
     for i in range(runs):
         t0 = time.perf_counter()
         res = model(img, verbose=False, conf=thr)[0]
-        times.append(time.perf_counter() - t0)
-        if i == runs - 1 and res.boxes:
+        dt = time.perf_counter() - t0
+        times.append(dt)
+
+        det_now = []
+        if res.boxes:
             for b in res.boxes:
                 cf, cid = float(b.conf.squeeze()), int(b.cls.squeeze())
                 if cf < thr or cid >= len(names):
                     continue
-                det.append((float(b.xywh.squeeze()[0]), names[cid], cf))
+                det_now.append((float(b.xywh.squeeze()[0]), names[cid], cf))
 
-    return *order_string(det), np.mean(times)
+        plate_now, conf_now = order_string(det_now)
+        if show_all:
+            print(f"      run {i+1}/{runs}: {plate_now:<15} "
+                  f"conf {conf_now:.3f}  {dt*1000:.1f} ms")
+        if i == runs - 1:                                # save last run result
+            det_final = det_now
+
+    plate_fin, conf_fin = order_string(det_final)
+    return plate_fin, conf_fin, float(np.mean(times))
 
 
 def run_tflite(path: str, img: np.ndarray, names: Sequence[str], thr: float,
                runs: int, img_sz: int, iou_thr: float,
-               no_xnnpack: bool, threads: int) -> Tuple[str, float, float]:
+               no_xnnpack: bool, threads: int, show_all: bool) -> Tuple[str, float, float]:
     try:
         from ai_edge_litert.interpreter import Interpreter
     except ImportError:
@@ -196,7 +196,7 @@ def run_tflite(path: str, img: np.ndarray, names: Sequence[str], thr: float,
 
     kwargs = {"model_path": path, "num_threads": threads}
     if no_xnnpack:
-        kwargs["experimental_delegates"] = []              # disable XNNPACK
+        kwargs["experimental_delegates"] = []
 
     it = Interpreter(**kwargs)
     it.allocate_tensors()
@@ -205,46 +205,53 @@ def run_tflite(path: str, img: np.ndarray, names: Sequence[str], thr: float,
     inp = preprocess(img, in_det, img_sz)
 
     it.set_tensor(in_det[0]["index"], inp)
-    it.invoke()                                            # прогрів
+    it.invoke()                                          # warm-up
 
-    times, det = [], []
+    times, det_final = [], []
     for i in range(runs):
         t0 = time.perf_counter()
         it.set_tensor(in_det[0]["index"], inp)
         it.invoke()
-        times.append(time.perf_counter() - t0)
-        if i == runs - 1:
-            det = parse_tflite_out(it, out_det, thr, names,
+        dt = time.perf_counter() - t0
+        times.append(dt)
+
+        det_now = parse_tflite_out(it, out_det, thr, names,
                                    in_w=img_sz, iou_thr=iou_thr)
+        plate_now, conf_now = order_string(det_now)
+        if show_all:
+            print(f"      run {i+1}/{runs}: {plate_now:<15} "
+                  f"conf {conf_now:.3f}  {dt*1000:.1f} ms")
+        if i == runs - 1:
+            det_final = det_now
 
-    return *order_string(det), np.mean(times)
+    plate_fin, conf_fin = order_string(det_final)
+    return plate_fin, conf_fin, float(np.mean(times))
 
 
-# ─────────────────────────────── CLI ───────────────────────────────────────
+# ────────────────────────────── CLI ─────────────────────────────────────
 def cli() -> argparse.Namespace:
     p = argparse.ArgumentParser("OCR-YOLO tester (PT / ONNX / TFLite-INT8)")
-    p.add_argument("-m", "--model", "--path", dest="model_paths",
-                   action="append", required=True,
-                   help="Шляхи до моделей (.pt / .onnx / .tflite)")
+    p.add_argument("-m", "--model", dest="model_paths", action="append",
+                   required=True, help="Шляхи до моделей (.pt / .onnx / .tflite)")
     p.add_argument("--image", required=True, help="Тестове зображення")
     p.add_argument("--input_size", type=int, default=320, help="Розмір інпуту")
     p.add_argument("--conf", type=float, default=0.12, help="Поріг conf")
     p.add_argument("--iou_thr", type=float, default=0.35, help="IoU-NMS поріг")
-    p.add_argument("--runs", type=int, default=5, help="Запусків для avg time")
+    p.add_argument("--runs", type=int, default=5, help="К-сть запусків для avg")
     p.add_argument("--no-xnnpack", action="store_true",
-                   help="Вимкнути XNNPACK delegate (детермінованість)")
-    p.add_argument("--threads", type=int, default=2,
-                   help="К-сть потоків для TFLite")
+                   help="Вимкнути XNNPACK delegate")
+    p.add_argument("--threads", type=int, default=2, help="Потоки для TFLite")
     p.add_argument("--clear-cache", action="store_true",
                    help="Очищати кеш/GC після кожної моделі")
+    p.add_argument("--show-all", action="store_true",
+                   help="Показувати розпізнання кожного run")
     return p.parse_args()
 
 
-# ─────────────────────────────── main ──────────────────────────────────────
+# ────────────────────────────── main ────────────────────────────────────
 if __name__ == "__main__":
     args = cli()
 
-    # перевірка наявності файлів
     for f in args.model_paths + [args.image]:
         if not os.path.exists(f):
             sys.exit(f"Файл не знайдено: {f}")
@@ -259,27 +266,28 @@ if __name__ == "__main__":
     print("\n===========  РЕЗУЛЬТАТИ  ===========")
     for mp in args.model_paths:
         ext = os.path.splitext(mp)[1].lower()
+        print(f"[{os.path.basename(mp):>12}]")
 
         if ext in (".pt", ".onnx"):
-            plate, conf, t = run_pt_or_onnx(mp, img, names,
-                                            args.conf, args.runs)
+            plate, conf, t = run_pt_or_onnx(mp, img, names, args.conf,
+                                            args.runs, args.show_all)
 
         elif ext == ".tflite":
-            plate, conf, t = run_tflite(mp, img, names,
-                                        args.conf, args.runs,
+            plate, conf, t = run_tflite(mp, img, names, args.conf, args.runs,
                                         img_sz=args.input_size,
                                         iou_thr=args.iou_thr,
                                         no_xnnpack=args.no_xnnpack,
-                                        threads=args.threads)
+                                        threads=args.threads,
+                                        show_all=args.show_all)
         else:
-            print(f"[{os.path.basename(mp):>12}]  ❌ Формат не підтримується.")
+            print("  ❌ Формат не підтримується.")
             continue
 
-        print(f"[{os.path.basename(mp):>12}]  Plate: {plate:<15} "
-              f"Avg conf: {conf:.3f}  Time: {t*1000:.1f} ms")
+        print(f"  ↪  Plate: {plate:<15}  Avg conf: {conf:.3f}  "
+              f"Avg time: {t*1000:.1f} ms\n")
 
         if args.clear_cache:
-            del plate, conf, t                      # звільняємо об’єкти
+            del plate, conf, t
             gc.collect()
 
     print("====================================\n")
