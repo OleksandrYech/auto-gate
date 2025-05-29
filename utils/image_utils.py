@@ -100,9 +100,6 @@ def draw_text_with_background(
     bg_x2 = origin[0] + text_width + padding
     bg_y2 = origin[1] + baseline + padding
 
-    # Перевірка, щоб фон не виходив за межі зображення (опціонально, але корисно)
-    # bg_x1 = max(0, bg_x1); bg_y1 = max(0, bg_y1)
-    # bg_x2 = min(image.shape[1], bg_x2); bg_y2 = min(image.shape[0], bg_y2)
 
     cv2.rectangle(image, (bg_x1, bg_y1), (bg_x2, bg_y2), bg_color, cv2.FILLED)
     cv2.putText(image, text, origin, font_face, font_scale, text_color, thickness, cv2.LINE_AA)

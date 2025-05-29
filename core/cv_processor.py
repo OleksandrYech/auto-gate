@@ -3,9 +3,9 @@ import logging
 import time
 import json
 import os
-import cv2  # OpenCV для обробки зображень
+import cv2
 import numpy as np
-import onnxruntime  # Для запуску моделей ONNX (залишаємо для vehicle та license plate)
+import onnxruntime
 
 try:
     from ultralytics import YOLO
@@ -14,6 +14,9 @@ try:
 except ImportError:
     ULTRALYTICS_AVAILABLE = False
     YOLO = None
+
+# Імпорт з image_utils
+from utils.image_utils import save_image, crop_image, draw_bounding_box, draw_text_with_background
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +29,8 @@ COCO_LABEL_MAP = {
     1: 'person', 2: 'bicycle', 3: 'car', 4: 'motorcycle', 5: 'airplane',
     6: 'bus', 7: 'train', 8: 'truck', 9: 'boat', 10: 'traffic light',
 }
-TARGET_VEHICLE_CLASS_IDS = [3, 4, 6, 8]  # car, motorcycle, bus, truck
-LICENSE_PLATE_CLASS_ID = 0  # Очікуваний ID класу для номерних знаків
+TARGET_VEHICLE_CLASS_IDS = [3, 4, 6, 8]
+LICENSE_PLATE_CLASS_ID = 0
 
 
 class CVProcessor:
@@ -40,7 +43,7 @@ class CVProcessor:
                  plate_confidence_thresh: float = 0.6,
                  ocr_confidence_thresh: float = 0.4,
                  ocr_nms_thresh: float = 0.35,
-                 plate_nms_thresh: float = 0.45,  # Не використовується, якщо _parse_license_plate_output не робить NMS
+                 plate_nms_thresh: float = 0.45,
                  vehicle_input_target_size: tuple = (300, 300),
                  ocr_input_target_size_for_ultralytics: int = 320
                  ):
@@ -51,7 +54,7 @@ class CVProcessor:
         self.plate_confidence_thresh = plate_confidence_thresh
         self.ocr_confidence_thresh = ocr_confidence_thresh
         self.ocr_nms_thresh = ocr_nms_thresh
-        self.plate_nms_thresh = plate_nms_thresh  # Може не використовуватися, залежно від _parse_license_plate_output
+        self.plate_nms_thresh = plate_nms_thresh
 
         self.vehicle_session = self._load_onnx_model(mobilenet_ssd_path)
         self.plate_session = self._load_onnx_model(license_model_path)
@@ -77,7 +80,7 @@ class CVProcessor:
         }
         if self.vehicle_session:
             actual_vehicle_outputs = [output.name for output in self.vehicle_session.get_outputs()]
-            for key, name_val in self.vehicle_output_names_map.items():  # Змінено name на name_val
+            for key, name_val in self.vehicle_output_names_map.items():
                 if name_val not in actual_vehicle_outputs:
                     self._logger.error(
                         f"Очікуване вихідне ім'я '{name_val}' для MobileNet SSD (для '{key}') не знайдено. Знайдено: {actual_vehicle_outputs}")
@@ -117,29 +120,20 @@ class CVProcessor:
         self._logger.info("CVProcessor успішно ініціалізовано.")
 
     def _iou1d(self, box1_x1x2: tuple, box2_x1x2: tuple) -> float:
-        # ... (без змін) ...
         x1_inter = max(box1_x1x2[0], box2_x1x2[0])
         x2_inter = min(box1_x1x2[1], box2_x1x2[1])
         intersection = max(0.0, x2_inter - x1_inter)
-        if intersection == 0:
-            return 0.0
+        if intersection == 0: return 0.0
         len1 = box1_x1x2[1] - box1_x1x2[0]
         len2 = box2_x1x2[1] - box2_x1x2[0]
         union = len1 + len2 - intersection
         return intersection / (union + 1e-6)
 
     def _load_onnx_model(self, model_path: str):
-        # ... (без змін) ...
         if not model_path or not os.path.exists(model_path):
             self._logger.error(f"Файл моделі ONNX не знайдено за шляхом: {model_path}")
             return None
         try:
-            # Для потенційної оптимізації можна додати sess_options
-            # opts = onnxruntime.SessionOptions()
-            # opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL # Або ORT_ENABLE_EXTENDED
-            # opts.enable_cpu_mem_arena = True
-            # opts.enable_mem_pattern = True
-            # session = onnxruntime.InferenceSession(model_path, sess_options=opts, providers=['CPUExecutionProvider'])
             providers = ['CPUExecutionProvider']
             session = onnxruntime.InferenceSession(model_path, providers=providers)
             self._logger.info(f"Модель ONNX успішно завантажено з: {model_path} (Провайдер: {session.get_providers()})")
@@ -150,7 +144,6 @@ class CVProcessor:
 
     def _preprocess_image_yolo(self, image_bgr: np.ndarray, target_size: tuple) -> tuple[
         np.ndarray, float, tuple[int, int]]:
-        # ... (без змін) ...
         img_h, img_w = image_bgr.shape[:2]
         input_w, input_h = target_size
         scale = min(input_w / img_w, input_h / img_h)
@@ -169,7 +162,6 @@ class CVProcessor:
         return input_tensor, scale, (left_pad, top_pad)
 
     def _preprocess_image_mobilenet_ssd(self, image_bgr: np.ndarray, target_size: tuple) -> np.ndarray:
-        # ... (без змін) ...
         self._logger.debug(
             f"Preprocessing for SSD. Input image shape: {image_bgr.shape}, target_size for resize: {target_size}")
         resized_image_bgr = cv2.resize(image_bgr, target_size, interpolation=cv2.INTER_LINEAR)
@@ -205,19 +197,24 @@ class CVProcessor:
 
             if x1 >= x2 or y1 >= y2:
                 self._logger.warning(
-                    f"ROI для {camera_type} має некоректні або нульові розміри після перевірки меж ({x1},{y1},{x2},{y2}). ROI не застосовано.")
+                    f"ROI для {camera_type} має некоректні або нульові розміри ({x1},{y1},{x2},{y2}). ROI не застосовано.")
                 return image_bgr, None, (0, 0)
-            cropped_image = image_bgr[y1:y2, x1:x2]
-            self._logger.info(
-                f"Застосовано ROI [{x1},{y1},{x2},{y2}] для камери '{camera_type}'. Розмір обрізаного: {cropped_image.shape}")
-            return cropped_image, (x1, y1, x2, y2), (x1, y1)
+            # Використовуємо crop_image з image_utils
+            cropped_image = crop_image(image_bgr, (x1, y1, x2, y2))
+            if cropped_image is not None:
+                self._logger.info(
+                    f"Застосовано ROI [{x1},{y1},{x2},{y2}] для камери '{camera_type}'. Розмір обрізаного: {cropped_image.shape}")
+                return cropped_image, (x1, y1, x2, y2), (x1, y1)
+            else:  # crop_image повернув None
+                self._logger.warning(f"crop_image повернув None для ROI [{x1},{y1},{x2},{y2}]. ROI не застосовано.")
+                return image_bgr, None, (0, 0)
 
         self._logger.debug(f"ROI для камери '{camera_type}' не застосовано. Обробка повного кадру.")
         return image_bgr, None, (0, 0)
 
     def detect_vehicle_in_frame(self, image_bgr: np.ndarray, camera_type: str = "entry", save_debug_image: bool = False,
                                 save_path_prefix: str = "debug_cv", timestamp: str = "") -> list | None:
-        # ... (без змін) ...
+        # ... (без змін, але тепер _apply_roi використовує crop_image з image_utils) ...
         if not self.vehicle_session:
             self._logger.error("Модель детекції автомобілів (vehicle_session) не завантажена.")
             return None
@@ -282,13 +279,13 @@ class CVProcessor:
             if save_debug_image and img_to_process_roi is not None and img_to_process_roi.size > 0:
                 img_with_vehicle_detections = img_to_process_roi.copy()
                 for x1, y1, x2, y2, scr, cls_name in temp_detections_on_roi:
-                    cv2.rectangle(img_with_vehicle_detections, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(img_with_vehicle_detections, f"{cls_name} {scr:.2f}", (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                vehicle_det_filename = f"{timestamp}_1a_vehicle_detections_on_processed.jpg"
-                if roi_abs_coords:
-                    vehicle_det_filename = f"{timestamp}_1a_vehicle_detections_on_roi.jpg"
-                cv2.imwrite(os.path.join(save_path_prefix, vehicle_det_filename), img_with_vehicle_detections)
+                    # Використовуємо draw_bounding_box з image_utils
+                    draw_bounding_box(img_with_vehicle_detections, (x1, y1, x2, y2), cls_name, scr, color=(0, 255, 0))
+
+                vehicle_det_filename_base = f"{timestamp}_1a_vehicle_detections_on_"
+                vehicle_det_filename_suffix = "roi.jpg" if roi_abs_coords else "processed.jpg"
+                save_image(img_with_vehicle_detections, save_path_prefix,
+                           vehicle_det_filename_base + vehicle_det_filename_suffix)
 
             self._logger.info(
                 f"Реальна детекція: Виявлено {len(detections_on_original)} цільових транспортних засобів на камері '{camera_type}'.")
@@ -308,73 +305,48 @@ class CVProcessor:
             self._logger.warning(
                 f"Неочікуваний формат виходу моделі НЗ: {raw_lp_output.shape if raw_lp_output is not None else 'None'}")
             return []
-
         predictions = raw_lp_output[0]
-
         lp_input_h, lp_input_w = self.plate_model_input_size[1], self.plate_model_input_size[0]
         orig_img_h, orig_img_w = original_lp_input_shape[:2]
         pad_x, pad_y = pad_xy_for_lp_input
-
         for pred in predictions:
             x1_norm, y1_norm, x2_norm, y2_norm = pred[:4]
             score = float(pred[4])
             cls_id = int(pred[5])
-
-            if score < self.plate_confidence_thresh:
-                continue
-
-            x1_padded = x1_norm * lp_input_w
-            y1_padded = y1_norm * lp_input_h
-            x2_padded = x2_norm * lp_input_w
-            y2_padded = y2_norm * lp_input_h
-
-            x1_resized = x1_padded - pad_x
-            y1_resized = y1_padded - pad_y
-            x2_resized = x2_padded - pad_x
-            y2_resized = y2_padded - pad_y
-
-            x1_orig = int(x1_resized / scale_to_lp_input)
-            y1_orig = int(y1_resized / scale_to_lp_input)
-            x2_orig = int(x2_resized / scale_to_lp_input)
-            y2_orig = int(y2_resized / scale_to_lp_input)
-
-            x1_orig = max(0, x1_orig)
-            y1_orig = max(0, y1_orig)
-            x2_orig = min(orig_img_w, x2_orig)
-            y2_orig = min(orig_img_h, y2_orig)
-
+            if score < self.plate_confidence_thresh: continue
+            x1_padded, y1_padded = x1_norm * lp_input_w, y1_norm * lp_input_h
+            x2_padded, y2_padded = x2_norm * lp_input_w, y2_norm * lp_input_h
+            x1_resized, y1_resized = x1_padded - pad_x, y1_padded - pad_y
+            x2_resized, y2_resized = x2_padded - pad_x, y2_padded - pad_y
+            x1_orig, y1_orig = int(x1_resized / scale_to_lp_input), int(y1_resized / scale_to_lp_input)
+            x2_orig, y2_orig = int(x2_resized / scale_to_lp_input), int(y2_resized / scale_to_lp_input)
+            x1_orig, y1_orig = max(0, x1_orig), max(0, y1_orig)
+            x2_orig, y2_orig = min(orig_img_w, x2_orig), min(orig_img_h, y2_orig)
             if x1_orig >= x2_orig or y1_orig >= y2_orig: continue
-
             detections.append((x1_orig, y1_orig, x2_orig, y2_orig, score, cls_id))
-
         return detections
 
     def detect_license_plate(self, vehicle_image_bgr: np.ndarray, save_debug_image: bool = False,
                              save_path_prefix: str = "debug_cv", timestamp: str = "") -> tuple | None:
-        # ... (без змін) ...
+        # ... (без змін, крім використання save_image з image_utils) ...
         if not self.plate_session:
             self._logger.error("Модель детекції номерних знаків не завантажена.")
             return None
         if vehicle_image_bgr is None or vehicle_image_bgr.size == 0:
             self._logger.warning("Зображення автомобіля для детекції НЗ порожнє.")
             return None
-
         input_tensor, scale, pad_xy = self._preprocess_image_yolo(vehicle_image_bgr, self.plate_model_input_size)
-
         try:
             raw_outputs = self.plate_session.run(self.plate_output_names, {self.plate_input_name: input_tensor})[0]
-            detections = self._parse_license_plate_output(
-                raw_outputs, vehicle_image_bgr.shape, scale, pad_xy
-            )
+            detections = self._parse_license_plate_output(raw_outputs, vehicle_image_bgr.shape, scale, pad_xy)
 
             if save_debug_image:
                 img_with_plate_detections = vehicle_image_bgr.copy()
                 for x1, y1, x2, y2, score, cls_id in detections:
-                    cv2.rectangle(img_with_plate_detections, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                    cv2.putText(img_with_plate_detections, f"LP {score:.2f} (ID:{cls_id})", (x1, y1 - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-                cv2.imwrite(os.path.join(save_path_prefix, f"{timestamp}_1b_plate_detections_on_vehicle.jpg"),
-                            img_with_plate_detections)
+                    draw_bounding_box(img_with_plate_detections, (x1, y1, x2, y2), f"LP (ID:{cls_id})", score,
+                                      color=(255, 0, 0))
+                save_image(img_with_plate_detections, save_path_prefix,
+                           f"{timestamp}_1b_plate_detections_on_vehicle.jpg")
 
             if detections:
                 plate_detections = [d for d in detections if d[5] == LICENSE_PLATE_CLASS_ID]
@@ -383,7 +355,6 @@ class CVProcessor:
                         f"Номерний знак не виявлено (class_id != {LICENSE_PLATE_CLASS_ID} або не знайдено).")
                     return None
                 best_plate = max(plate_detections, key=lambda item: item[4])
-
                 self._logger.info(f"Номерний знак виявлено з впевненістю {best_plate[4]:.2f}")
                 return best_plate
             else:
@@ -393,44 +364,34 @@ class CVProcessor:
             self._logger.error(f"Помилка під час детекції номерного знаку: {e}", exc_info=True)
             return None
 
+    # _postprocess_yolo_detections - залишаємо для потенційного використання з іншими YOLO ONNX моделями,
+    # але для OCR зараз використовується Ultralytics YOLO().predict()
     def _postprocess_yolo_detections(self, outputs: list, original_image_shape: tuple,
                                      scale: float, pad_xy: tuple, conf_thresh: float, nms_thresh: float,
                                      is_ocr: bool = False) -> list:
-        # Цей метод більше НЕ ВИКОРИСТОВУЄТЬСЯ для OCR, якщо self.ocr_model_ultralytics завантажено.
-        # Залишено для потенційної сумісності або якщо Ultralytics недоступний.
         if is_ocr and self.ocr_model_ultralytics:
-            self._logger.debug(
-                "_postprocess_yolo_detections пропущено для OCR, оскільки використовується Ultralytics YOLO.")
-            return []  # Повертаємо порожній список, оскільки обробка йде в recognize_plate_characters
-
+            self._logger.debug("_postprocess_yolo_detections пропущено для OCR, використовується Ultralytics YOLO.")
+            return []
+            # ... (решта коду _postprocess_yolo_detections з 1D NMS, як було раніше)
         self._logger.debug(f"_postprocess_yolo_detections викликано (is_ocr={is_ocr}).")
-        # ... (код _postprocess_yolo_detections з 1D NMS для is_ocr=True залишається тут) ...
         detections = []
         if not outputs or outputs[0] is None:
             self._logger.warning(f"Порожній або None вихід з моделі {'OCR' if is_ocr else 'Plate'}.")
             return []
 
         predictions = outputs[0][0]
-
         all_candidates = []
         if is_ocr:
-            input_w_model, input_h_model = (320,
-                                            320)  # Типовий розмір, якщо ocr_model_input_size не визначено для onnxruntime
-            # Намагаємося отримати розмір, якщо він був встановлений для ручного ONNX OCR
-            if hasattr(self, 'ocr_model_input_size_onnxruntime'):
-                input_w_model, input_h_model = self.ocr_model_input_size_onnxruntime
-
+            input_w_model, input_h_model = getattr(self, 'ocr_model_input_size_onnxruntime', (320, 320))
             current_conf_thresh = self.ocr_confidence_thresh
             current_nms_thresh = self.ocr_nms_thresh
         else:
             input_w_model, input_h_model = self.plate_model_input_size
             current_conf_thresh = self.plate_confidence_thresh
             current_nms_thresh = self.plate_nms_thresh
-
         for pred_idx in range(predictions.shape[0]):
             pred = predictions[pred_idx]
             object_confidence = pred[4]
-
             if is_ocr and object_confidence > 0.01:
                 temp_class_id_log = int(pred[5])
                 temp_cx_log, _, temp_w_norm_log, _ = pred[:4]
@@ -441,99 +402,56 @@ class CVProcessor:
                     f"cx_p={temp_x_center_padded_log:.1f}, w_p={temp_w_padded_log:.1f}, "
                     f"score={object_confidence:.2f}, class_id={temp_class_id_log}"
                 )
-
-            if object_confidence < current_conf_thresh:
-                continue
-
-            class_id = int(pred[5])
+            if object_confidence < current_conf_thresh: continue
+            class_id = int(pred[5]);
             score = object_confidence
-
             cx, cy, w_norm, h_norm = pred[:4]
-
-            x_center_padded = cx * input_w_model
-            y_center_padded = cy * input_h_model
-            w_padded = w_norm * input_w_model
-            h_padded = h_norm * input_h_model
-
+            x_center_padded, y_center_padded = cx * input_w_model, cy * input_h_model
+            w_padded, h_padded = w_norm * input_w_model, h_norm * input_h_model
             if w_padded < 1 or h_padded < 1: continue
-
-            x1_padded = int(x_center_padded - w_padded / 2)
-            y1_padded = int(y_center_padded - h_padded / 2)
+            x1_padded, y1_padded = int(x_center_padded - w_padded / 2), int(y_center_padded - h_padded / 2)
             x2_padded = int(x_center_padded + w_padded / 2)
-
-            all_candidates.append({
-                "x_interval_padded": (x1_padded, x2_padded),
-                "full_box_padded": [x1_padded, y1_padded, int(w_padded), int(h_padded)],
-                "score": float(score),
-                "class_id": class_id
-            })
-
-        if not all_candidates:
-            return []
-
-        if is_ocr:  # 1D NMS для OCR
+            all_candidates.append({"x_interval_padded": (x1_padded, x2_padded),
+                                   "full_box_padded": [x1_padded, y1_padded, int(w_padded), int(h_padded)],
+                                   "score": float(score), "class_id": class_id})
+        if not all_candidates: return []
+        if is_ocr:
             all_candidates.sort(key=lambda c: c["score"], reverse=True)
             kept_ocr_candidates = []
             for cand in all_candidates:
                 is_suppressed = False
                 for kept_cand in kept_ocr_candidates:
                     if self._iou1d(cand["x_interval_padded"], kept_cand["x_interval_padded"]) > current_nms_thresh:
-                        is_suppressed = True
+                        is_suppressed = True;
                         break
-                if not is_suppressed:
-                    kept_ocr_candidates.append(cand)
+                if not is_suppressed: kept_ocr_candidates.append(cand)
             processed_candidates = kept_ocr_candidates
-        else:  # Стандартний 2D NMS для інших випадків
+        else:
             boxes_for_2d_nms = [cand["full_box_padded"] for cand in all_candidates]
             scores_for_2d_nms = [cand["score"] for cand in all_candidates]
             raw_indices = cv2.dnn.NMSBoxes(boxes_for_2d_nms, scores_for_2d_nms,
-                                           score_threshold=current_conf_thresh,
-                                           nms_threshold=current_nms_thresh)
+                                           score_threshold=current_conf_thresh, nms_threshold=current_nms_thresh)
             processed_candidates = [all_candidates[i] for i in raw_indices.flatten()] if len(raw_indices) > 0 else []
-
-        img_h_orig, img_w_orig = original_image_shape[:2]
+        img_h_orig, img_w_orig = original_image_shape[:2];
         pad_x, pad_y = pad_xy
-
         for selected_cand in processed_candidates:
-            x1_padded_box, y1_padded_box, w_padded_box, h_padded_box = selected_cand["full_box_padded"]
-            x1_resized = x1_padded_box - pad_x
-            y1_resized = y1_padded_box - pad_y
-            x1_orig = int(x1_resized / scale)
-            y1_orig = int(y1_resized / scale)
-            x2_orig = int((x1_resized + w_padded_box) / scale)
-            y2_orig = int((y1_resized + h_padded_box) / scale)
-            x1_orig = max(0, x1_orig)
-            y1_orig = max(0, y1_orig)
-            x2_orig = min(img_w_orig, x2_orig)
-            y2_orig = min(img_h_orig, y2_orig)
-            if x1_orig >= x2_orig or y1_orig >= y2_orig: continue
-            final_class_id = selected_cand["class_id"]
-            score_val = selected_cand["score"]
-            if is_ocr:
-                if 0 <= final_class_id < len(CHAR_LIST):
-                    label = CHAR_LIST[final_class_id]
-                else:
-                    self._logger.warning(
-                        f"OCR: Отримано некоректний class_id ({final_class_id}), який виходить за межі CHAR_LIST. Пропуск символу.")
-                    continue
-            else:
-                label = final_class_id
-            detections.append((x1_orig, y1_orig, x2_orig, y2_orig, score_val, label))
+            x1_p, y1_p, w_p, h_p = selected_cand["full_box_padded"]
+            x1_r, y1_r = x1_p - pad_x, y1_p - pad_y
+            x1, y1 = int(x1_r / scale), int(y1_r / scale)
+            x2, y2 = int((x1_r + w_p) / scale), int((y1_r + h_p) / scale)
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(img_w_orig, x2), min(img_h_orig, y2)
+            if x1 >= x2 or y1 >= y2: continue
+            final_cls_id, scr_val = selected_cand["class_id"], selected_cand["score"]
+            lbl = CHAR_LIST[final_cls_id] if is_ocr and 0 <= final_cls_id < len(CHAR_LIST) else \
+                (final_cls_id if not is_ocr else (self._logger.warning(f"OCR: Invalid class_id {final_cls_id}"), None))
+            if lbl is not None: detections.append((x1, y1, x2, y2, scr_val, lbl))
         return detections
-
-    def _crop_image(self, image_bgr: np.ndarray, bbox: tuple) -> np.ndarray | None:
-        # ... (без змін) ...
-        x1, y1, x2, y2 = map(int, bbox[:4])
-        if image_bgr is None or x1 < 0 or y1 < 0 or x2 > image_bgr.shape[1] or y2 > image_bgr.shape[
-            0] or x1 >= x2 or y1 >= y2:
-            self._logger.warning(
-                f"Некоректні координати ({x1},{y1},{x2},{y2}) для обрізки зображення розміром {image_bgr.shape if image_bgr is not None else 'None'}.")
-            return None
-        return image_bgr[y1:y2, x1:x2]
 
     def recognize_plate_characters(self, plate_image_bgr: np.ndarray, save_debug_image: bool = False,
                                    save_path_prefix: str = "debug_cv", timestamp: str = "") -> str | None:
-        # ... (код з попереднього виправлення, використовує self.ocr_model_ultralytics) ...
+        # ... (код з попереднього виправлення, використовує self.ocr_model_ultralytics,
+        #      але тепер використовує image_utils.save_image для збереження ..._INPUT_TO_OCR.jpg
+        #      та image_utils.draw_bounding_box для візуалізації ..._ocr_detections_on_plate_YOLO.jpg ) ...
         if not self.ocr_model_ultralytics:
             self._logger.error("Модель OCR (Ultralytics) не завантажена або бібліотека 'ultralytics' недоступна.")
             return None
@@ -543,10 +461,7 @@ class CVProcessor:
             return None
 
         if save_debug_image:
-            os.makedirs(save_path_prefix, exist_ok=True)
-            input_ocr_filename = os.path.join(save_path_prefix, f"{timestamp}_2d_INPUT_TO_OCR.jpg")
-            cv2.imwrite(input_ocr_filename, plate_image_bgr)
-            self._logger.info(f"Збережено вхідне зображення для OCR: {input_ocr_filename}")
+            save_image(plate_image_bgr, save_path_prefix, f"{timestamp}_2d_INPUT_TO_OCR.jpg")
 
         char_detections_for_vis = []
         recognized_text = ""
@@ -571,9 +486,7 @@ class CVProcessor:
                     if 0 <= class_id < len(CHAR_LIST):
                         char_str = CHAR_LIST[class_id]
                         score = float(box_data.conf[0])
-
                         x1, y1, x2, y2 = map(int, box_data.xyxy[0].cpu().numpy())
-
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(orig_w, x2), min(orig_h, y2)
                         if x1 >= x2 or y1 >= y2: continue
@@ -586,21 +499,21 @@ class CVProcessor:
                 temp_chars_for_sorting.sort(key=lambda item: item['x'])
                 recognized_text = "".join([item['char'] for item in temp_chars_for_sorting])
             else:
-                self._logger.info(
-                    "OCR (YOLO): Символи на номерному знаку не виявлено (results[0].boxes порожній або відсутній).")
+                self._logger.info("OCR (YOLO): Символи на номерному знаку не виявлено.")
 
             if save_debug_image:
                 img_with_ocr_detections = plate_image_bgr.copy()
                 if char_detections_for_vis:
                     for x1_vis, y1_vis, x2_vis, y2_vis, score_vis, char_str_vis in char_detections_for_vis:
-                        cv2.rectangle(img_with_ocr_detections, (x1_vis, y1_vis), (x2_vis, y2_vis), (0, 255, 255), 1)
-                        cv2.putText(img_with_ocr_detections, f"{char_str_vis} {score_vis:.2f}", (x1_vis, y1_vis - 2),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                        # Використовуємо draw_bounding_box з image_utils
+                        draw_bounding_box(img_with_ocr_detections, (x1_vis, y1_vis, x2_vis, y2_vis),
+                                          label=char_str_vis, score=score_vis, color=(0, 255, 255), thickness=1,
+                                          text_color=(0, 0, 0), bg_text_color=(0, 255, 255))  # Жовтий фон для тексту
                 else:
-                    cv2.putText(img_with_ocr_detections, "No Chars Detected (YOLO)", (10, 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                cv2.imwrite(os.path.join(save_path_prefix, f"{timestamp}_2b_ocr_detections_on_plate_YOLO.jpg"),
-                            img_with_ocr_detections)
+                    draw_text_with_background(img_with_ocr_detections, "No Chars Detected (YOLO)", (10, 30),
+                                              bg_color=(0, 0, 150))
+                save_image(img_with_ocr_detections, save_path_prefix,
+                           f"{timestamp}_2b_ocr_detections_on_plate_YOLO.jpg")
 
             if not recognized_text:
                 self._logger.info("OCR (YOLO): Текст не розпізнано.")
@@ -617,21 +530,18 @@ class CVProcessor:
     def get_plate_number_from_image(self, image_bgr: np.ndarray, camera_type: str = "entry",
                                     save_intermediate_steps: bool = False,
                                     save_path_prefix: str = "debug_cv") -> str | None:
-        # ... (без змін) ...
         if image_bgr is None or image_bgr.size == 0:
             self._logger.warning("Вхідне зображення для get_plate_number_from_image порожнє або None.")
             return None
 
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         if save_intermediate_steps:
-            os.makedirs(save_path_prefix, exist_ok=True)
-            cv2.imwrite(os.path.join(save_path_prefix, f"{timestamp}_0_orig_{camera_type}.jpg"), image_bgr)
+            save_image(image_bgr, save_path_prefix, f"{timestamp}_0_orig_{camera_type}.jpg")
 
         img_after_roi, roi_abs_coords, _ = self._apply_roi(image_bgr, camera_type)
         if save_intermediate_steps and roi_abs_coords:
             if img_after_roi is not None and img_after_roi.size > 0:
-                cv2.imwrite(os.path.join(save_path_prefix, f"{timestamp}_0a_roi_applied_{camera_type}.jpg"),
-                            img_after_roi)
+                save_image(img_after_roi, save_path_prefix, f"{timestamp}_0a_roi_applied_{camera_type}.jpg")
 
         vehicles = self.detect_vehicle_in_frame(
             image_bgr, camera_type=camera_type,
@@ -645,13 +555,14 @@ class CVProcessor:
             return None
 
         best_vehicle_bbox = vehicles[0][:4]
-        vehicle_image = self._crop_image(image_bgr, best_vehicle_bbox)
+        # Використовуємо crop_image з image_utils
+        vehicle_image = crop_image(image_bgr, best_vehicle_bbox)
 
         if vehicle_image is None:
             self._logger.warning("Не вдалося обрізати зображення автомобіля (з get_plate_number_from_image).")
             return None
         if save_intermediate_steps:
-            cv2.imwrite(os.path.join(save_path_prefix, f"{timestamp}_1c_vehicle_crop_final.jpg"), vehicle_image)
+            save_image(vehicle_image, save_path_prefix, f"{timestamp}_1c_vehicle_crop_final.jpg")
 
         plate_detection_result = self.detect_license_plate(
             vehicle_image,
@@ -663,13 +574,14 @@ class CVProcessor:
             return None
 
         plate_bbox_on_vehicle = plate_detection_result[:4]
-        plate_image = self._crop_image(vehicle_image, plate_bbox_on_vehicle)
+        # Використовуємо crop_image з image_utils
+        plate_image = crop_image(vehicle_image, plate_bbox_on_vehicle)
 
         if plate_image is None:
             self._logger.warning("Не вдалося обрізати зображення номерного знаку (з get_plate_number_from_image).")
             return None
         if save_intermediate_steps:
-            cv2.imwrite(os.path.join(save_path_prefix, f"{timestamp}_2c_plate_crop_final.jpg"), plate_image)
+            save_image(plate_image, save_path_prefix, f"{timestamp}_2c_plate_crop_final.jpg")
 
         plate_text = self.recognize_plate_characters(
             plate_image,
@@ -683,23 +595,21 @@ class CVProcessor:
             if save_intermediate_steps:
                 final_img_display = image_bgr.copy()
                 if roi_abs_coords:
-                    cv2.rectangle(final_img_display, (roi_abs_coords[0], roi_abs_coords[1]),
-                                  (roi_abs_coords[2], roi_abs_coords[3]), (0, 0, 255), 2)
+                    draw_bounding_box(final_img_display, roi_abs_coords, "ROI", color=(0, 0, 255))
 
-                cv2.rectangle(final_img_display, (best_vehicle_bbox[0], best_vehicle_bbox[1]),
-                              (best_vehicle_bbox[2], best_vehicle_bbox[3]), (0, 255, 0), 2)
+                draw_bounding_box(final_img_display, best_vehicle_bbox, vehicles[0][5], score=vehicles[0][4],
+                                  color=(0, 255, 0))
 
                 plate_x1_abs = best_vehicle_bbox[0] + plate_bbox_on_vehicle[0]
                 plate_y1_abs = best_vehicle_bbox[1] + plate_bbox_on_vehicle[1]
                 plate_x2_abs = best_vehicle_bbox[0] + plate_bbox_on_vehicle[2]
                 plate_y2_abs = best_vehicle_bbox[1] + plate_bbox_on_vehicle[3]
 
-                cv2.rectangle(final_img_display, (plate_x1_abs, plate_y1_abs),
-                              (plate_x2_abs, plate_y2_abs), (255, 0, 0), 2)
-                cv2.putText(final_img_display, plate_text, (plate_x1_abs, plate_y1_abs - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
-                cv2.imwrite(os.path.join(save_path_prefix, f"{timestamp}_3_final_all_detections.jpg"),
-                            final_img_display)
+                plate_full_abs_bbox = (plate_x1_abs, plate_y1_abs, plate_x2_abs, plate_y2_abs)
+                draw_bounding_box(final_img_display, plate_full_abs_bbox, plate_text, score=plate_detection_result[4],
+                                  color=(255, 0, 0))
+
+                save_image(final_img_display, save_path_prefix, f"{timestamp}_3_final_all_detections.jpg")
             return plate_text
         else:
             return None
@@ -707,6 +617,7 @@ class CVProcessor:
 
 # --- Приклад використання (для тестування модуля окремо) ---
 if __name__ == '__main__':
+    # ... (без змін)
     if not ULTRALYTICS_AVAILABLE:
         logger.error("Бібліотека 'ultralytics' не встановлена. Тестування OCR через YOLO() неможливе.")
 
@@ -728,7 +639,7 @@ if __name__ == '__main__':
     os.makedirs(test_output_dir, exist_ok=True)
 
     for model_name_onnx in ["ssd_mobilenetv1.onnx", "license.onnx"]:
-        model_file_path = os.path.join(models_base_dir, model_name_onnx)  # Змінено ім'я змінної
+        model_file_path = os.path.join(models_base_dir, model_name_onnx)
         if not os.path.exists(model_file_path):
             logger.warning(f"Створюю фіктивний файл моделі: {model_file_path}")
             try:
@@ -738,7 +649,7 @@ if __name__ == '__main__':
 
     TEST_MOBILENET_PATH = os.path.join(models_base_dir, "ssd_mobilenetv1.onnx")
     TEST_LICENSE_MODEL_PATH = os.path.join(models_base_dir, "license.onnx")
-    TEST_OCR_MODEL_PATH = os.path.join(models_base_dir, "ocr.pt")  # Змінено на .pt
+    TEST_OCR_MODEL_PATH = os.path.join(models_base_dir, "ocr.pt")
 
     if not os.path.exists(TEST_OCR_MODEL_PATH) and ULTRALYTICS_AVAILABLE:
         logger.error(
@@ -782,7 +693,7 @@ if __name__ == '__main__':
             cv_proc = CVProcessor(
                 mobilenet_ssd_path=TEST_MOBILENET_PATH,
                 license_model_path=TEST_LICENSE_MODEL_PATH,
-                ocr_model_path=TEST_OCR_MODEL_PATH,  # Тепер тут має бути шлях до ocr.pt
+                ocr_model_path=TEST_OCR_MODEL_PATH,
                 roi_config_path=roi_example_path,
                 vehicle_input_target_size=(300, 300),
                 ocr_nms_thresh=0.35,

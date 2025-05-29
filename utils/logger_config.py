@@ -5,8 +5,6 @@ import os
 import sys
 
 # --- Константи для логування ---
-# Шлях до файлу логів (відносно кореня проекту)
-# Припускаємо, що ця утиліта знаходиться в utils/, а логи мають бути в logs/ на рівні проекту
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
 LOG_FILENAME = "gate_system.log"
 LOG_FILE_PATH = os.path.join(LOG_DIR, LOG_FILENAME)
@@ -53,7 +51,6 @@ def setup_global_logging(app_log_level: int = APP_LOG_LEVEL,
         root_logger.setLevel(app_log_level)  # Встановлюємо мінімальний рівень для обробки
 
         # --- Обробник для файлу з ротацією ---
-        # RotatingFileHandler автоматично керує розміром файлу логів
         file_handler = logging.handlers.RotatingFileHandler(
             LOG_FILE_PATH,
             maxBytes=LOG_MAX_BYTES,
@@ -84,18 +81,9 @@ def setup_global_logging(app_log_level: int = APP_LOG_LEVEL,
         initial_logger.info(f"Рівень логування консолі: {logging.getLevelName(console_log_level)}")
 
     except Exception as e:
-        # Якщо налаштування логування не вдалося, виводимо помилку в stderr
-        # і використовуємо базову конфігурацію логування, щоб помилка була видима.
         logging.basicConfig(level=logging.ERROR)
         logging.exception("Критична помилка під час налаштування системи логування!", exc_info=e)
-        # Можливо, варто тут завершити програму, якщо логи критично важливі
-        # sys.exit(1)
 
-
-# Приклад того, як можна отримати логгер у інших модулях після налаштування:
-# import logging
-# logger = logging.getLogger(__name__)
-# logger.debug("Це повідомлення DEBUG рівня")
 
 if __name__ == '__main__':
     # Цей блок для тестування самого logger_config.py
