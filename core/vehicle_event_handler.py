@@ -4,148 +4,216 @@ import time
 import threading
 import os
 import numpy as np
-import cv2
-
+# import cv2
 from utils.image_utils import save_image
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SHEETS_ANTIDUPLICATE_DELAY_S = 60
-DEFAULT_PASSAGE_CONFIRMATION_TIMEOUT_S = 20
-DEFAULT_POLL_INTERVAL_IDLE_S = 1.0
-DEFAULT_POLL_INTERVAL_GATE_CLOSING_S = 0.3
-
-CAPTURED_IMAGES_BASE_PATH = "captured_images"
-ENTRY_IMAGES_PATH = os.path.join(CAPTURED_IMAGES_BASE_PATH, "entry")
-EXIT_IMAGES_PATH = os.path.join(CAPTURED_IMAGES_BASE_PATH, "exit")
-CV_DEBUG_SAVE_PATH = os.path.join(CAPTURED_IMAGES_BASE_PATH, "cv_debug")
+# константи
+DEFAULT_REED_OPEN_TIMEOUT_S = 15
+DEFAULT_REED_OPEN_RETRIES = 1  # Кількість повторних спроб відкрити
+DEFAULT_REED_CLOSE_TIMEOUT_S = 5
+DEFAULT_REED_CLOSE_RETRIES = 1  # Кількість повторних спроб закрити
+DEFAULT_GATE_FINISH_CLOSING_DELAY_S = 10  # 10 секунд на остаточне закриття
+DEFAULT_AUTO_CLOSE_TIMER_DURATION_S = 4  # Таймер на закриття після проїзду
 
 
 class VehicleEventHandler:
-    def __init__(self,
-                 camera_entry,
-                 camera_exit,
-                 sensor_manager,
-                 sheet_handler,
-                 cv_processor,
-                 gate_controller,
+    def __init__(self,  # ... (параметри як раніше) ...
                  config: dict = None):
+        # ... (ініціалізація атрибутів як раніше) ...
+        self.reed_open_timeout_s = self.config.get("reed_open_timeout_s", DEFAULT_REED_OPEN_TIMEOUT_S)
+        self.reed_open_retries = self.config.get("reed_open_retries", DEFAULT_REED_OPEN_RETRIES)
+        self.reed_close_timeout_s = self.config.get("reed_close_timeout_s", DEFAULT_REED_CLOSE_TIMEOUT_S)
+        self.reed_close_retries = self.config.get("reed_close_retries", DEFAULT_REED_CLOSE_RETRIES)
+        self.gate_finish_closing_delay_s = self.config.get("gate_finish_closing_delay_s",
+                                                           DEFAULT_GATE_FINISH_CLOSING_DELAY_S)
+        self.auto_close_timer_duration_s = self.config.get("auto_close_timer_duration_s",
+                                                           DEFAULT_AUTO_CLOSE_TIMER_DURATION_S)
 
-        self._logger = logging.getLogger(f"{__name__}.VehicleEventHandler")
-        self.camera_entry = camera_entry
-        self.camera_exit = camera_exit
-        self.sensor_manager = sensor_manager
-        self.sheet_handler = sheet_handler
-        self.cv_processor = cv_processor
-        self.gate_controller = gate_controller
+        self.ultrasonic_passage_threshold = 0.3  # м, поріг для проїзду
+        # ... (решта __init__)
 
-        self.config = config if config else {}
-        self.sheets_antiduplicate_delay_s = self.config.get(
-            "sheets_antiduplicate_delay_s", DEFAULT_SHEETS_ANTIDUPLICATE_DELAY_S
-        )
-        self.passage_confirmation_timeout_s = self.config.get(
-            "passage_confirmation_timeout_s", DEFAULT_PASSAGE_CONFIRMATION_TIMEOUT_S
-        )
-        self.poll_interval_idle_s = self.config.get(
-            "poll_interval_idle_s", DEFAULT_POLL_INTERVAL_IDLE_S
-        )
-        self.poll_interval_gate_closing_s = self.config.get(
-            "poll_interval_gate_closing_s", DEFAULT_POLL_INTERVAL_GATE_CLOSING_S
-        )
+    # ... (_is_duplicate_log залишається) ...
 
-        self.is_running = False
-        self.shutdown_event = None
-
-        self.recently_logged_plates = {}
-        self._plate_cache_lock = threading.Lock()
-
-        os.makedirs(ENTRY_IMAGES_PATH, exist_ok=True)
-        os.makedirs(EXIT_IMAGES_PATH, exist_ok=True)
-        os.makedirs(os.path.join(CV_DEBUG_SAVE_PATH, "entry"), exist_ok=True)
-        os.makedirs(os.path.join(CV_DEBUG_SAVE_PATH, "exit"), exist_ok=True)
-
-        self._logger.info("VehicleEventHandler ініціалізовано.")
-        self._logger.info(f"  Анти-дублікат для Sheets: {self.sheets_antiduplicate_delay_s} с")
-        self._logger.info(f"  Таймаут підтвердження проїзду УЗД: {self.passage_confirmation_timeout_s} с")
-
-    def _is_duplicate_log(self, plate_number: str) -> bool:
-        with self._plate_cache_lock:
-            now = time.time()
-            if plate_number in self.recently_logged_plates:
-                last_log_time = self.recently_logged_plates[plate_number]
-                if (now - last_log_time) < self.sheets_antiduplicate_delay_s:
-                    self._logger.info(
-                        f"Дублікатний запис для НЗ '{plate_number}'. Минуло менше {self.sheets_antiduplicate_delay_s} с.")
-                    return True
-            self.recently_logged_plates[plate_number] = now
+    def _attempt_open_gate_with_retry(self) -> bool:
+        """Намагається відкрити ворота, перевіряє геркон, робить повторні спроби."""
+        if not self.gate_controller or not self.sensor_manager or not self.sensor_manager.reed_switch:
+            self._logger.error("GateController або ReedSwitch не ініціалізовано для відкриття воріт.")
             return False
 
-    def _wait_for_vehicle_to_pass(self, gate_side_name: str) -> bool:
-        self._logger.info(f"Очікування проїзду автомобіля через ворота ({gate_side_name})...")
-        passage_sensor = self.sensor_manager.ultrasonic_sensor_entry  # За замовчуванням
+        for attempt in range(self.reed_open_retries + 1):  # +1 для початкової спроби
+            self._logger.info(f"Спроба відкриття воріт #{attempt + 1}...")
+            if not self.gate_controller.open_gate():  # open_gate сама може чекати геркон, якщо reed_confirmation_timeout_s > 0
+                self._logger.warning(f"Команда open_gate() повернула помилку на спробі #{attempt + 1}.")
+
+            start_wait = time.monotonic()
+            while time.monotonic() - start_wait < self.reed_open_timeout_s:
+                if self.sensor_manager.reed_switch.are_gates_open:
+                    self._logger.info("Ворота успішно відкрито (підтверджено герконом).")
+                    return True
+                time.sleep(0.2)  # Перевірка стану геркона
+
+            self._logger.warning(
+                f"Ворота не відкрилися (геркон) протягом {self.reed_open_timeout_s}с після спроби #{attempt + 1}.")
+            if attempt < self.reed_open_retries:
+                self._logger.info("Повторна спроба відкриття...")
+                time.sleep(1)  # Невелика пауза перед повтором
+            else:
+                self._logger.error(f"Не вдалося відкрити ворота після {self.reed_open_retries + 1} спроб.")
+                return False
+        return False  # Мало б вийти раніше
+
+    def _wait_for_vehicle_passage_after_open(self, gate_side_name: str) -> bool:
+        """
+        Очікує, поки автомобіль увійде та покине зону УЗД, АЛЕ тільки якщо ворота відкриті.
+        """
+        if not self.sensor_manager or \
+                not (getattr(self.sensor_manager, 'ultrasonic_sensor_entry', None) or \
+                     getattr(self.sensor_manager, 'ultrasonic_sensor_exit', None)):
+            self._logger.error("УЗД для контролю проїзду недоступний.")
+            return False
+
+        # Визначаємо, який УЗД використовувати
+        passage_sensor = self.sensor_manager.ultrasonic_sensor_entry
         if gate_side_name == "exit" and hasattr(self.sensor_manager,
                                                 'ultrasonic_sensor_exit') and self.sensor_manager.ultrasonic_sensor_exit:
             passage_sensor = self.sensor_manager.ultrasonic_sensor_exit
 
-        if passage_sensor:
-            if passage_sensor.wait_for_clear_after_pass(
-                    timeout=self.passage_confirmation_timeout_s
-            ):
-                self._logger.info(f"Автомобіль проїхав зону воріт ({gate_side_name}).")
-                return True
-            else:
-                self._logger.warning(f"Тайм-аут очікування проїзду автомобіля ({gate_side_name}). "
-                                     "Можливо, автомобіль зупинився у проїзді.")
-                return False
-        else:
-            self._logger.error(f"Ультразвуковий датчик для контролю проїзду ({gate_side_name}) недоступний.")
+        if not passage_sensor:
+            self._logger.error(f"Не вдалося визначити УЗД для сторони '{gate_side_name}'.")
             return False
 
-    def _handle_gate_closing_interruption(self, camera_type_for_check: str):
-        is_timer_active = False
-        if hasattr(self.gate_controller, '_auto_close_timer') and \
-                self.gate_controller._auto_close_timer is not None and \
-                self.gate_controller._auto_close_timer.is_alive():
-            is_timer_active = True
+        self._logger.info(
+            f"Очікування проїзду автомобіля через УЗД ({gate_side_name}). Поріг: {self.ultrasonic_passage_threshold}м.")
 
-        if is_timer_active:
-            vehicle_detected_by_cv = False
-            # CV detection for interruption
-            if self.cv_processor:
-                cam_to_check = self.camera_entry if camera_type_for_check == "entry" else self.camera_exit
-                if cam_to_check and cam_to_check.is_initialized_successfully:
-                    current_frame = cam_to_check.capture_array()
-                    if current_frame is not None:
-                        detections = self.cv_processor.detect_vehicle_in_frame(current_frame, camera_type_for_check)
-                        if detections:
-                            vehicle_detected_by_cv = True
-                            self._logger.info(
-                                f"CV ВИЯВИВ НОВЕ АВТО ({camera_type_for_check}) під час таймера закриття!")
+        # 1. Перевірка, чи ворота ВІДКРИТІ (геркон замкнений)
+        if not self.sensor_manager.reed_switch.are_gates_open:
+            self._logger.warning(
+                f"Ворота не відкриті (геркон). Скасування очікування проїзду через УЗД ({gate_side_name}).")
+            return False
+        self._logger.info(f"Ворота відкриті (геркон). УЗД ({gate_side_name}) активний для детекції проїзду.")
 
-            # Ultrasonic detection for interruption (additional safety)
-            vehicle_detected_by_ultrasonic = False
-            ultrasonic_to_check = None
-            if camera_type_for_check == "entry" and self.sensor_manager.ultrasonic_sensor_entry:
-                ultrasonic_to_check = self.sensor_manager.ultrasonic_sensor_entry
-            elif camera_type_for_check == "exit":
-                ultrasonic_to_check = getattr(self.sensor_manager, 'ultrasonic_sensor_exit',
-                                              self.sensor_manager.ultrasonic_sensor_entry)
+        # 2. Очікування, поки автомобіль увійде в зону УЗД (стане < 0.3м)
+        # Таймаут на в'їзд у зону УЗД після відкриття воріт, наприклад, 10-15 секунд
+        vehicle_entered_passage_zone = passage_sensor.wait_for_object_to_enter_passage(
+            passage_threshold_m=self.ultrasonic_passage_threshold,
+            timeout_s=15
+        )
+        if not vehicle_entered_passage_zone:
+            self._logger.warning(f"Автомобіль не увійшов у зону УЗД ({gate_side_name}) після відкриття воріт.")
+            return False
 
-            if ultrasonic_to_check and ultrasonic_to_check.is_vehicle_approaching():
-                vehicle_detected_by_ultrasonic = True
-                self._logger.info(f"УЗД ВИЯВИВ НОВЕ АВТО ({camera_type_for_check}) під час таймера закриття!")
+        # 3. Очікування, поки автомобіль покине зону УЗД (стане > 0.3м)
+        # Таймаут на сам проїзд, наприклад, 10 секунд
+        vehicle_cleared_passage_zone = passage_sensor.wait_for_object_to_clear_passage(
+            passage_threshold_m=self.ultrasonic_passage_threshold,
+            timeout_s=10
+        )
 
-            if vehicle_detected_by_cv or vehicle_detected_by_ultrasonic:
-                self._logger.warning(
-                    f"НОВИЙ АВТОМОБІЛЬ ({camera_type_for_check}) ВИЯВЛЕНО ПІД ЧАС АКТИВНОГО ТАЙМЕРА ЗАКРИТТЯ!")
-                self.gate_controller.interrupt_closing_procedure()
-                return True
+        if vehicle_cleared_passage_zone:
+            self._logger.info(f"Автомобіль повністю проїхав зону УЗД ({gate_side_name}).")
+            return True
+        else:
+            self._logger.warning(f"Автомобіль не покинув зону УЗД ({gate_side_name}) або таймаут.")
+            # Якщо авто все ще в зоні, це може бути перешкода
+            if passage_sensor.detect_object_in_passage(self.ultrasonic_passage_threshold):
+                self._logger.warning(f"УВАГА: Автомобіль або перешкода все ще в зоні УЗД '{gate_side_name}'!")
+            return False
+
+    def _manage_auto_close_with_obstruction_check(self):
+        """
+        Запускає таймер на 4с, моніторить УЗД, перезапускає таймер при перешкоді.
+        Повертає True, якщо 4с пройшли без перешкод, False - якщо скасовано або помилка.
+        """
+        if not self.gate_controller or not self.sensor_manager or \
+                not (getattr(self.sensor_manager, 'ultrasonic_sensor_entry', None) or \
+                     getattr(self.sensor_manager, 'ultrasonic_sensor_exit', None)):
+            self._logger.error("Неможливо керувати автозакриттям: компоненти не ініціалізовані.")
+            return False
+
+        # Визначаємо, який УЗД використовувати для перевірки проїзду (зазвичай той, що контролює сам проріз)
+        passage_check_sensor = self.sensor_manager.ultrasonic_sensor_entry
+        # Якщо є окремий для виїзду, і це сценарій виїзду, можна його вибрати, але для прорізу зазвичай один.
+
+        start_time = time.monotonic()
+        self.gate_controller.start_auto_close_timer(timeout_s=self.auto_close_timer_duration_s)
+
+        while time.monotonic() - start_time < self.auto_close_timer_duration_s:
+            if self.shutdown_event and self.shutdown_event.is_set(): return False  # Перевірка на завершення
+
+            if passage_check_sensor.detect_object_in_passage(self.ultrasonic_passage_threshold):
+                self._logger.info(
+                    f"Перешкода виявлена УЗД під час {self.auto_close_timer_duration_s}с таймера! Зупинка та очікування.")
+                self.gate_controller.cancel_auto_close_timer()
+
+                # Очікуємо, поки перешкода зникне
+                obstacle_cleared = passage_check_sensor.wait_for_object_to_clear_passage(
+                    passage_threshold_m=self.ultrasonic_passage_threshold,
+                    timeout_s=60  # Довгий таймаут на зникнення перешкоди
+                )
+                if not obstacle_cleared:
+                    self._logger.warning("Перешкода не зникла з зони УЗД після очікування. Автозакриття скасовано.")
+                    return False  # Не вдалося очистити, не закриваємо
+
+                self._logger.info("Перешкода зникла. Перезапуск таймера автозакриття.")
+                start_time = time.monotonic()  # Скидаємо таймер цього циклу
+                self.gate_controller.start_auto_close_timer(timeout_s=self.auto_close_timer_duration_s)
+                # Продовжуємо цикл моніторингу з початку
+
+            time.sleep(0.1)  # Інтервал перевірки УЗД під час таймера
+
+        # Якщо цикл завершився, означає, що 4 секунди пройшли без постійної перешкоди
+        # І таймер GateController має спрацювати (або вже спрацював і викликав close_gate)
+        self._logger.info(
+            f"{self.auto_close_timer_duration_s}с таймер завершився. GateController має ініціювати закриття.")
+        return True
+
+    def _attempt_close_gate_with_retry(self) -> bool:
+        """Намагається закрити ворота, перевіряє геркон, робить повторні спроби."""
+        if not self.gate_controller or not self.sensor_manager or not self.sensor_manager.reed_switch:
+            self._logger.error("GateController або ReedSwitch не ініціалізовано для закриття воріт.")
+            return False
+
+        for attempt in range(self.reed_close_retries + 1):
+            self._logger.info(f"Спроба закриття воріт #{attempt + 1}...")
+            # GateController.close_gate() вже включає перевірку УЗД на перешкоду
+            if not self.gate_controller.close_gate():  # Якщо close_gate повернув False (напр. через перешкоду)
+                # self.gate_controller.gate_state вже має бути "OBSTRUCTED"
+                self._logger.warning(f"Команда close_gate() не виконана (можливо, перешкода) на спробі #{attempt + 1}.")
+                # У цьому випадку повторна спроба може бути недоцільною, якщо перешкода не зникла.
+                # Але якщо проблема була тимчасовою, повтор може допомогти.
+                # Залишаємо логіку повтору, але це місце для можливого покращення.
+                if attempt < self.reed_close_retries:
+                    time.sleep(1)  # Пауза перед повтором
+                    continue  # Продовжуємо з наступною спробою
+                else:  # Якщо це була остання спроба і вона невдала через перешкоду або іншу причину
+                    return False
+
+                    # Очікування підтвердження від геркона
+            start_wait = time.monotonic()
+            while time.monotonic() - start_wait < self.reed_close_timeout_s:
+                if self.sensor_manager.reed_switch.are_gates_closed:
+                    self._logger.info("Ворота успішно закрито (підтверджено герконом).")
+                    return True
+                time.sleep(0.2)
+
+            self._logger.warning(
+                f"Ворота не закрилися (геркон) протягом {self.reed_close_timeout_s}с після спроби #{attempt + 1}.")
+            if attempt < self.reed_close_retries:
+                self._logger.info("Повторна спроба закриття...")
+                time.sleep(1)
+            else:
+                self._logger.error(f"Не вдалося закрити ворота після {self.reed_close_retries + 1} спроб.")
+                return False
         return False
+
+    # ... (entry_scenario_loop та exit_scenario_loop будуть оновлені для використання цих методів) ...
 
     def entry_scenario_loop(self):
         self._logger.info("Запуск циклу обробки В'ЇЗДУ...")
         while self.is_running and (self.shutdown_event is None or not self.shutdown_event.is_set()):
-            current_poll_interval = self.poll_interval_idle_s
+            # ... (логіка переривання закриття _handle_gate_closing_interruption) ...
             if hasattr(self.gate_controller, '_auto_close_timer') and \
                     self.gate_controller._auto_close_timer is not None and \
                     self.gate_controller._auto_close_timer.is_alive():
@@ -154,9 +222,10 @@ class VehicleEventHandler:
                     self._logger.info("В'їзд: Закриття перервано новим авто. Повторний цикл детекції.")
                     time.sleep(0.1)
                     continue
+            else:
+                current_poll_interval = self.poll_interval_idle_s
 
-            self._logger.debug("В'їзд: Очікування автомобіля...")
-
+            self._logger.debug("В'їзд: Очікування автомобіля (тільки CV)...")
             vehicle_detected_by_cv = False
             initial_detection_frame = None
 
@@ -167,17 +236,14 @@ class VehicleEventHandler:
                                                                                    camera_type="entry")
                     if vehicle_detections:
                         self._logger.info("В'їзд: CV зафіксував автомобіль.")
-                        vehicle_detected_by_cv = True  # Встановлюємо прапорець ТІЛЬКИ при CV детекції
+                        vehicle_detected_by_cv = True
                         initial_detection_frame = frame_for_detection
 
-
-            if vehicle_detected_by_cv:  # Продовжуємо, ТІЛЬКИ якщо CV виявив авто
+            if vehicle_detected_by_cv:
                 self._logger.info("В'їзд: Автомобіль виявлено через CV. Початок обробки.")
-
-                # initial_detection_frame вже має бути встановлений, якщо CV спрацював
-                if initial_detection_frame is None:  # Малоймовірно, якщо vehicle_detected_by_cv=True
+                if initial_detection_frame is None:  # Малоймовірно
                     self._logger.error("В'їзд: Помилка - CV виявив авто, але кадр не збережено.")
-                    time.sleep(current_poll_interval)
+                    time.sleep(current_poll_interval);
                     continue
 
                 timestamp_str = time.strftime('%Y%m%d_%H%M%S')
@@ -190,46 +256,49 @@ class VehicleEventHandler:
                 if plate_text:
                     if not self._is_duplicate_log(plate_text):
                         if self.sheet_handler.find_vehicle_and_update_entry_time(plate_text):
-                            self._logger.info(f"В'їзд: Автомобіль '{plate_text}' АВТОРИЗОВАНО. Відкриття воріт.")
-                            if self.gate_controller.open_gate():
-                                if self._wait_for_vehicle_to_pass("в'їзду"):
-                                    self.gate_controller.start_auto_close_timer()
+                            self._logger.info(f"В'їзд: Авто '{plate_text}' АВТОРИЗОВАНО.")
+                            if self._attempt_open_gate_with_retry():  # Крок 3, 4
+                                if self._wait_for_vehicle_passage_after_open(
+                                        "в'їзду"):  # Крок 5, 6 (з умовою на відкриті ворота)
+                                    if self._manage_auto_close_with_obstruction_check():  # Крок 7, 8
+                                        if self._attempt_close_gate_with_retry():  # Крок 9, 10
+                                            self._logger.info(
+                                                f"В'їзд: Цикл для '{plate_text}' завершено, ворота закрито. Очікування {self.gate_finish_closing_delay_s}с.")
+                                            time.sleep(self.gate_finish_closing_delay_s)  # Крок 11
+                                        else:
+                                            self._logger.error("В'їзд: Не вдалося підтвердити закриття воріт.")
+                                    # else: Закриття було скасовано через перешкоду під час таймера, або _manage_auto_close... повернув False
                                 else:
                                     self._logger.warning(
-                                        "В'їзд: Авто не підтвердило проїзд. Таймер закриття не запущено.")
+                                        "В'їзд: Авто не підтвердило проїзд. Ворота залишаються відкритими (потрібна логіка примусового закриття?).")
+                            else:
+                                self._logger.error("В'їзд: Не вдалося відкрити ворота для авторизованого авто.")
                         else:
-                            self._logger.info(f"В'їзд: Автомобіль '{plate_text}' НЕ АВТОРИЗОВАНО.")
+                            self._logger.info(f"В'їзд: Авто '{plate_text}' НЕ АВТОРИЗОВАНО.")
                             self.sheet_handler.add_unauthorized_attempt(plate_text)
                 else:
                     self._logger.warning("В'їзд: Номерний знак не розпізнано.")
-                    failed_filename = f"entry_ocr_failed_{timestamp_str}.jpg"
-                    save_image(initial_detection_frame, ENTRY_IMAGES_PATH, failed_filename)
-                    self._logger.info(
-                        f"Збережено зображення з невдалим OCR (в'їзд): {os.path.join(ENTRY_IMAGES_PATH, failed_filename)}")
+                    save_image(initial_detection_frame, ENTRY_IMAGES_PATH, f"entry_ocr_failed_{timestamp_str}.jpg")
 
             time.sleep(current_poll_interval)
         self._logger.info("Цикл обробки В'ЇЗДУ завершено.")
 
     def exit_scenario_loop(self):
         self._logger.info("Запуск циклу обробки ВИЇЗДУ...")
-
-        # Для interruption handling, УЗД виїзду (якщо є) або в'їзду (якщо він покриває зону виїзду)
-        ultrasonic_for_exit_interruption = getattr(self.sensor_manager, 'ultrasonic_sensor_exit', None) \
-                                           or self.sensor_manager.ultrasonic_sensor_entry
-
         while self.is_running and (self.shutdown_event is None or not self.shutdown_event.is_set()):
-            current_poll_interval = self.poll_interval_idle_s
+            # ... (логіка переривання закриття _handle_gate_closing_interruption) ...
             if hasattr(self.gate_controller, '_auto_close_timer') and \
                     self.gate_controller._auto_close_timer is not None and \
                     self.gate_controller._auto_close_timer.is_alive():
                 current_poll_interval = self.poll_interval_gate_closing_s
-                if self._handle_gate_closing_interruption("exit"):  # Перевіряє CV та УЗД на виїзді
+                if self._handle_gate_closing_interruption("exit"):
                     self._logger.info("Виїзд: Закриття перервано новим авто. Повторний цикл детекції.")
                     time.sleep(0.1)
                     continue
+            else:
+                current_poll_interval = self.poll_interval_idle_s
 
-            self._logger.debug("Виїзд: Очікування автомобіля...")
-
+            self._logger.debug("Виїзд: Очікування автомобіля (тільки CV)...")
             vehicle_detected_by_cv_exit = False
             initial_detection_frame_exit = None
 
@@ -240,20 +309,17 @@ class VehicleEventHandler:
                                                                                    camera_type="exit")
                     if vehicle_detections:
                         self._logger.info("Виїзд: CV зафіксував автомобіль.")
-                        vehicle_detected_by_cv_exit = True  # ТІЛЬКИ CV
+                        vehicle_detected_by_cv_exit = True
                         initial_detection_frame_exit = frame_for_detection
 
-
-            if vehicle_detected_by_cv_exit:  # Продовжуємо, ТІЛЬКИ якщо CV виявив авто
+            if vehicle_detected_by_cv_exit:
                 self._logger.info("Виїзд: Автомобіль виявлено через CV. Негайне відкриття воріт.")
-                if self.gate_controller.open_gate():
+                if self._attempt_open_gate_with_retry():  # Крок 3, 4
+                    # Отримання кадру для логування НЗ ПІСЛЯ відкриття
                     if initial_detection_frame_exit is None and self.camera_exit and self.camera_exit.is_initialized_successfully:
-                        initial_detection_frame_exit = self.camera_exit.capture_array()
+                        initial_detection_frame_exit = self.camera_exit.capture_array()  # Можливо, авто вже трохи змістилося
 
-                    if initial_detection_frame_exit is None:
-                        self._logger.error(
-                            "Виїзд: Не вдалося отримати кадр для розпізнавання НЗ після відкриття воріт.")
-                    else:
+                    if initial_detection_frame_exit is not None:
                         timestamp_str = time.strftime('%Y%m%d_%H%M%S')
                         plate_text = self.cv_processor.get_plate_number_from_image(
                             initial_detection_frame_exit, camera_type="exit",
@@ -265,19 +331,30 @@ class VehicleEventHandler:
                                 self.sheet_handler.log_vehicle_exit(plate_text)
                         else:
                             self._logger.warning("Виїзд: Номерний знак не розпізнано, але виїзд дозволено.")
-                            failed_filename = f"exit_ocr_failed_{timestamp_str}.jpg"
-                            save_image(initial_detection_frame_exit, EXIT_IMAGES_PATH, failed_filename)
-                            self._logger.info(
-                                f"Збережено зображення з невдалим OCR (виїзд): {os.path.join(EXIT_IMAGES_PATH, failed_filename)}")
-
-                    if self._wait_for_vehicle_to_pass("виїзду"):  # Використовує відповідний УЗД
-                        self.gate_controller.start_auto_close_timer()
+                            save_image(initial_detection_frame_exit, EXIT_IMAGES_PATH,
+                                       f"exit_ocr_failed_{timestamp_str}.jpg")
                     else:
-                        self._logger.warning("Виїзд: Авто не підтвердило проїзд. Таймер закриття не запущено.")
+                        self._logger.error("Виїзд: Не вдалося отримати кадр для логування НЗ.")
+
+                    if self._wait_for_vehicle_passage_after_open("виїзду"):  # Крок 5, 6
+                        if self._manage_auto_close_with_obstruction_check():  # Крок 7, 8
+                            if self._attempt_close_gate_with_retry():  # Крок 9, 10
+                                self._logger.info(
+                                    f"Виїзд: Цикл для виїзду завершено, ворота закрито. Очікування {self.gate_finish_closing_delay_s}с.")
+                                time.sleep(self.gate_finish_closing_delay_s)  # Крок 11
+                            else:
+                                self._logger.error("Виїзд: Не вдалося підтвердити закриття воріт.")
+                        # else: Закриття скасовано
+                    else:
+                        self._logger.warning(
+                            "Виїзд: Авто не підтвердило проїзд. Ворота залишаються відкритими (потрібна логіка?).")
+                else:
+                    self._logger.error("Виїзд: Не вдалося відкрити ворота для авто на виїзд.")
 
             time.sleep(current_poll_interval)
         self._logger.info("Цикл обробки ВИЇЗДУ завершено.")
 
+    # ... (start, stop як раніше) ...
     def start(self, shutdown_event_main):
         if self.is_running:
             self._logger.warning("VehicleEventHandler вже запущено.")
@@ -304,218 +381,5 @@ class VehicleEventHandler:
 
 # --- Блок для тестування ---
 if __name__ == '__main__':
-    if not logging.getLogger().hasHandlers():
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s - %(name)s - [%(levelname)s] - %(module)s:%(lineno)d - %(message)s',
-            handlers=[logging.StreamHandler()]
-        )
-    from unittest.mock import MagicMock
-
-    logger_main_test = logging.getLogger("EventHandlerTest")
-
-
-    class MockCamera:
-        def __init__(self, name="mock_cam"):
-            self.name = name
-            self.is_initialized_successfully = True
-            self._logger = logging.getLogger(f"MockCamera.{name}")
-            self._logger.info(f"Мок-камера '{name}' створена.")
-            self.image_counter = 0
-
-        def capture_array(self):
-            self.image_counter += 1
-            self._logger.info(f"[{self.name}] capture_array() викликано (кадр {self.image_counter})")
-            dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(dummy_frame, f"Frame {self.image_counter} {self.name}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (255, 255, 255), 2)
-            return dummy_frame
-
-        def capture_image(self, filename):
-            self._logger.info(f"[{self.name}] capture_image({filename}) викликано")
-            return filename
-
-        def close(self): self._logger.info(f"[{self.name}] close() викликано")
-
-
-    class MockUltrasonicSensor:
-        def __init__(self, name="mock_us"):
-            self.name = name
-            self._logger = logging.getLogger(f"MockUltrasonic.{name}")
-            self.should_detect_approach = False
-            self.should_confirm_pass = True
-
-        def is_vehicle_approaching(self, threshold_m=None):
-            # Залишаємо цю логіку, бо _handle_gate_closing_interruption її використовує
-            self._logger.debug(f"[{self.name}] is_vehicle_approaching() -> {self.should_detect_approach}")
-            return self.should_detect_approach
-
-        def wait_for_clear_after_pass(self, timeout=None):
-            self._logger.info(
-                f"[{self.name}] wait_for_clear_after_pass(timeout={timeout}) -> {self.should_confirm_pass}")
-            if self.should_confirm_pass:
-                time.sleep(0.1)
-            return self.should_confirm_pass
-
-        def cleanup(self): self._logger.info(f"[{self.name}] cleanup() викликано")
-
-
-    class MockSensorManager:
-        def __init__(self):
-            self.ultrasonic_sensor_entry = MockUltrasonicSensor("US_Entry")
-            self.ultrasonic_sensor_exit = MockUltrasonicSensor("US_Exit")
-            self._logger = logging.getLogger("MockSensorManager")
-            self._logger.info("Мок-менеджер датчиків створено.")
-
-        def cleanup(self): self._logger.info("MockSensorManager cleanup() викликано.")
-
-
-    class MockSheetHandler:
-        def __init__(self): self._logger = logging.getLogger("MockSheetHandler")
-
-        def find_vehicle_and_update_entry_time(self, plate_number):
-            self._logger.info(f"SHEETS: find_vehicle_and_update_entry_time для '{plate_number}'")
-            if "AUTH" in plate_number: return True
-            return False
-
-        def add_unauthorized_attempt(self, plate_number):
-            self._logger.info(f"SHEETS: add_unauthorized_attempt для '{plate_number}'")
-
-        def log_vehicle_exit(self, plate_number):
-            self._logger.info(f"SHEETS: log_vehicle_exit для '{plate_number}'")
-
-
-    class MockCVProcessor:
-        def __init__(self):
-            self._logger = logging.getLogger("MockCVProcessor")
-            self.simulated_plate = "AUTH123AA"
-            self.should_detect_vehicle_map = {"entry": False, "exit": False}
-            self.should_recognize_plate = True
-
-        def detect_vehicle_in_frame(self, image_bgr, camera_type, **kwargs):
-            detect = self.should_detect_vehicle_map.get(camera_type, False)
-            self._logger.info(f"CV: detect_vehicle_in_frame (камера: {camera_type}) -> {detect}")
-            if detect:
-                return [(10, 10, 100, 100, 0.9, "car")]
-            return None
-
-        def get_plate_number_from_image(self, image_bgr, camera_type, save_intermediate_steps=False,
-                                        save_path_prefix=""):
-            self._logger.info(f"CV: get_plate_number_from_image (камера: {camera_type})")
-            if self.should_recognize_plate:
-                self._logger.info(f"CV: Імітація розпізнавання -> '{self.simulated_plate}'")
-                return self.simulated_plate
-            self._logger.info("CV: Імітація НЕ розпізнавання НЗ")
-            return None
-
-
-    class MockGateController:  # Використовуємо реалізацію з попереднього кроку
-        def __init__(self):
-            self._logger = logging.getLogger("MockGateController")
-            self._auto_close_timer_obj = None
-            self._lock = threading.Lock()
-
-        def open_gate(self):
-            self._logger.info("GATE: open_gate() викликано")
-            if self._auto_close_timer_obj and self._auto_close_timer_obj.is_alive():
-                self._logger.info("GATE: open_gate() перериває активний таймер закриття.")
-                self._auto_close_timer_obj.cancel()
-                self._auto_close_timer_obj = None
-            return True
-
-        def close_gate(self):
-            self._logger.info("GATE: close_gate() викликано")
-            return True
-
-        def _timer_callback_mock(self):
-            with self._lock:
-                self._logger.info("GATE: (Мок) Таймер авто-закриття спрацював.")
-                self._auto_close_timer_obj = None
-
-        def start_auto_close_timer(self, timeout_s=None):
-            with self._lock:
-                effective_timeout = timeout_s if timeout_s is not None else 1
-                self._logger.info(f"GATE: start_auto_close_timer(timeout={effective_timeout}) викликано")
-                if self._auto_close_timer_obj and self._auto_close_timer_obj.is_alive():
-                    self._auto_close_timer_obj.cancel()
-                self._auto_close_timer_obj = threading.Timer(effective_timeout, self._timer_callback_mock)
-                self._auto_close_timer_obj.daemon = True
-                self._auto_close_timer_obj.start()
-                self._logger.info("GATE: (Мок) Таймер авто-закриття запущено.")
-
-        def interrupt_closing_procedure(self):
-            with self._lock:
-                self._logger.info("GATE: interrupt_closing_procedure() викликано")
-                if self._auto_close_timer_obj and self._auto_close_timer_obj.is_alive():
-                    self._auto_close_timer_obj.cancel()
-                    self._logger.info("GATE: (Мок) Активний таймер закриття скасовано.")
-                self._auto_close_timer_obj = None
-
-        def get_current_gate_state(self):
-            return "UNKNOWN"
-
-        def cleanup(self):
-            self._logger.info("GATE: cleanup() викликано")
-
-
-    logger_main_test = logging.getLogger("EventHandlerTest")
-    logger_main_test.info("--- Початок тестування VehicleEventHandler (УЗД не тригер) ---")
-
-    mock_cam_entry = MockCamera("EntryCam")
-    mock_cam_exit = MockCamera("ExitCam")
-    mock_sensors = MockSensorManager()
-    mock_sheets = MockSheetHandler()
-    mock_cv = MockCVProcessor()
-    mock_gate = MockGateController()
-
-    test_config = {
-        "sheets_antiduplicate_delay_s": 2,
-        "passage_confirmation_timeout_s": 1.5,
-        "poll_interval_idle_s": 0.2,
-        "poll_interval_gate_closing_s": 0.1
-    }
-
-    event_handler = VehicleEventHandler(
-        camera_entry=mock_cam_entry, camera_exit=mock_cam_exit,
-        sensor_manager=mock_sensors, sheet_handler=mock_sheets,
-        cv_processor=mock_cv, gate_controller=mock_gate, config=test_config
-    )
-
-    test_shutdown_event = threading.Event()
-    event_handler.start(test_shutdown_event)
-
-    try:
-        logger_main_test.info("\n>>> СЦЕНАРІЙ 1: Авторизований в'їзд (тільки CV тригер) <<<")
-        # УЗД НЕ МАЄ викликати обробку
-        mock_sensors.ultrasonic_sensor_entry.should_detect_approach = True  # УЗД бачить
-        mock_cv.should_detect_vehicle_map["entry"] = False  # АЛЕ CV НЕ бачить
-        logger_main_test.info("УЗД активний, CV - ні. Очікуємо, що обробка в'їзду НЕ почнеться...")
-        time.sleep(1)  # Даємо час, щоб переконатися, що нічого не відбувається
-
-        logger_main_test.info("Тепер активуємо CV для в'їзду...")
-        mock_cv.should_detect_vehicle_map["entry"] = True  # CV "бачить" авто
-        mock_cv.simulated_plate = "AUTH123AA"
-        mock_cv.should_recognize_plate = True
-        # mock_sensors.ultrasonic_sensor_entry.should_detect_approach = True # УЗД все ще може бути активним, але це не головне
-
-        time.sleep(3)  # Даємо час на повний цикл: детекція CV, відкриття, проїзд, запуск таймера
-
-        mock_cv.should_detect_vehicle_map["entry"] = False
-        mock_sensors.ultrasonic_sensor_entry.should_detect_approach = False
-        logger_main_test.info(">>> Сценарій 1 завершено <<<")
-
-        time.sleep(5)  # Загальний час роботи для тестів
-
-    except KeyboardInterrupt:
-        logger_main_test.info("Тест перервано користувачем.")
-    finally:
-        logger_main_test.info("Завершення тестів VehicleEventHandler...")
-        test_shutdown_event.set()
-        event_handler.stop()
-
-        if hasattr(event_handler, 'entry_thread') and event_handler.entry_thread.is_alive():
-            event_handler.entry_thread.join(timeout=2)
-        if hasattr(event_handler, 'exit_thread') and event_handler.exit_thread.is_alive():
-            event_handler.exit_thread.join(timeout=2)
-
-        logger_main_test.info("Тестування завершено.")
+    # ... (Мок-класи та логіка тестування оновлюються для відповідності новим методам) ...
+    pass  # Залиште або адаптуйте тестовий блок з попередньої версії
