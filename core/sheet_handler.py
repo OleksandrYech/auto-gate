@@ -1,275 +1,351 @@
 # core/sheet_handler.py
 import gspread
-# from google.oauth2.service_account import Credentials
-# from gspread import authorize
-from oauth2client.service_account import ServiceAccountCredentials
+from oauth2client.service_account import ServiceAccountCredentials  # Старіший варіант
 import logging
 from datetime import datetime
-import os  # Для перевірки шляху до credentials у тесті
-from typing import Optional
-import time
+import os
+from typing import Optional, List  # Додано List для SCOPES
 
-# --- Global Configuration ---
-logger = logging.getLogger(__name__)  # Створюємо логгер для цього модуля
+# --- Глобальна конфігурація логування ---
+# logger = logging.getLogger(__name__)
 
-# --- Constants ---
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
-CREDENTIALS_FILE = 'config/credentials.json'
+# --- Константи ---
+DEFAULT_SCOPES: List[str] = ['https://www.googleapis.com/auth/spreadsheets',
+                             'https://www.googleapis.com/auth/drive.file']
+DEFAULT_CREDENTIALS_FILE: str = 'credentials.json'  # Розмістіть у config/ або передайте шлях
 
-# --- Google Sheet Details ---
-YOUR_SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1gz5snNdG06sPL0_w2zyWtca3BiAQ7ru8I93LqPVjrC4/edit?gid=0#gid=0'
+# !!! ВАЖЛИВО: Замініть це на URL вашої Google Таблиці або передайте через конструктор !!!
+DEFAULT_SPREADSHEET_URL: str = 'https://docs.google.com/spreadsheets/d/1gz5snNdG06sPL0_w2zyWtca3BiAQ7ru8I93LqPVjrC4/edit?gid=0#gid=0'  # Наприклад, той, що був у sheets.py
 
 # Назва аркуша
-VEHICLES_SHEET_NAME = 'Vehicles'
+DEFAULT_VEHICLES_SHEET_NAME: str = 'Vehicles'
 
 # В'їзд авторизованих: Стовпець A (Номер), Стовпець B (Час останнього в'їзду)
-ENTRY_PLATE_COL_A_NUM = 1  # Номер стовпця A (для gspread)
-ENTRY_TIMESTAMP_COL_B_NUM = 2  # Номер стовпця B
-ENTRY_DATA_START_ROW = 3  # Дані починаються з 3-го рядка
+ENTRY_PLATE_COL_A_NUM: int = 1
+ENTRY_TIMESTAMP_COL_B_NUM: int = 2
+ENTRY_DATA_START_ROW: int = 3
 
 # Неавторизовані спроби: Стовпець D (Номер), Стовпець E (Час спроби)
-UNAUTHORIZED_PLATE_COL_D_NUM = 4  # Номер стовпця D
-UNAUTHORIZED_TIMESTAMP_COL_E_NUM = 5  # Номер стовпця E
-UNAUTHORIZED_DATA_START_ROW = 3  # Дані починаються з 3-го рядка
+UNAUTHORIZED_PLATE_COL_D_NUM: int = 4
+UNAUTHORIZED_TIMESTAMP_COL_E_NUM: int = 5
+UNAUTHORIZED_DATA_START_ROW: int = 3
 
 # Лог виїзду: Стовпець G ("Номер"), Стовпець H ("Останній Виїзд")
-EXIT_PLATE_COL_G_NUM = 7  # Номер стовпця G
-EXIT_TIMESTAMP_COL_H_NUM = 8  # Номер стовпця H
-EXIT_DATA_START_ROW = 3  # Дані починаються з 3-го рядка
-
-# --- Глобальна змінна для клієнта gspread ---
-_sheet_client_instance: Optional[gspread.Client] = None
+EXIT_PLATE_COL_G_NUM: int = 7
+EXIT_TIMESTAMP_COL_H_NUM: int = 8
+EXIT_DATA_START_ROW: int = 3
 
 
-def _get_sheet_client() -> Optional[gspread.Client]:
-    """ Ініціалізує та повертає клієнт gspread. """
-    global _sheet_client_instance
-    if _sheet_client_instance is None:
-        logger.info(f"Спроба підключення до Google Sheets API через {CREDENTIALS_FILE}...")
-        try:
-            creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, SCOPES)
-            _sheet_client_instance = gspread.authorize(creds)
-            logger.info("Успішно підключено та авторизовано з Google Sheets API.")
-        except FileNotFoundError:
-            logger.error(f"Файл облікових даних '{CREDENTIALS_FILE}' не знайдено.")
-            _sheet_client_instance = None
-        except Exception as e:
-            logger.error(f"Не вдалося авторизуватися або підключитися до Google Sheets API: {e}", exc_info=True)
-            _sheet_client_instance = None
-    return _sheet_client_instance
-
-
-def _get_worksheet(sheet_name: str) -> Optional[gspread.Worksheet]:
-    """ Допоміжна функція для отримання конкретного аркуша. """
-    client = _get_sheet_client()
-    if not client: return None
-    try:
-        if not YOUR_SPREADSHEET_URL or YOUR_SPREADSHEET_URL == 'YOUR_SPREADSHEET_URL_HERE':
-            logger.error("URL таблиці не налаштовано. Встановіть значення YOUR_SPREADSHEET_URL.")
-            return None
-        spreadsheet = client.open_by_url(YOUR_SPREADSHEET_URL)
-        worksheet = spreadsheet.worksheet(sheet_name)
-        return worksheet
-    except gspread.exceptions.SpreadsheetNotFound:
-        logger.error(f"Таблицю не знайдено за URL: {YOUR_SPREADSHEET_URL}.")
-        return None
-    except gspread.exceptions.WorksheetNotFound:
-        logger.error(f"Аркуш '{sheet_name}' не знайдено в таблиці.")
-        return None
-    except Exception as e:
-        logger.error(f"Помилка відкриття аркуша '{sheet_name}': {e}", exc_info=True)
-        return None
-
-
-def find_vehicle_and_update_entry_time(plate_number: str) -> bool:
+class SheetHandler:
     """
-    Знаходить номерний знак в аркуші 'Vehicles' (Стовпець A).
-    Якщо знайдено (починаючи з ENTRY_DATA_START_ROW), оновлює час останнього в'їзду в Стовпці B.
+    Клас для взаємодії з Google Sheets для авторизації транспортних засобів
+    та логування подій в'їзду/виїзду.
     """
-    worksheet = _get_worksheet(VEHICLES_SHEET_NAME)
-    if not worksheet: return False
 
-    try:
-        logger.debug(f"Пошук номера '{plate_number}' для в'їзду в '{VEHICLES_SHEET_NAME}'.")
-        cell: Optional[gspread.Cell] = None
-        try:
-            # Шукаємо в усьому стовпці A
-            cells_found = worksheet.findall(plate_number, in_column=ENTRY_PLATE_COL_A_NUM)
-            # Фільтруємо ті, що знаходяться на або нижче ENTRY_DATA_START_ROW
-            valid_cells = [c for c in cells_found if c.row >= ENTRY_DATA_START_ROW]
-            if valid_cells:
-                cell = valid_cells[0]  # Беремо перше співпадіння, що задовольняє умову
-        except gspread.exceptions.CellNotFound:  # findall поверне порожній список, а не виняток
-            pass
+    def __init__(self,
+                 spreadsheet_url: str = DEFAULT_SPREADSHEET_URL,
+                 credentials_file: str = DEFAULT_CREDENTIALS_FILE,
+                 scopes: List[str] = None,  # Використовуватиме DEFAULT_SCOPES, якщо None
+                 vehicles_sheet_name: str = DEFAULT_VEHICLES_SHEET_NAME):
+        """
+        Ініціалізація SheetHandler.
 
-        if cell:  # cell тепер містить gspread.Cell, якщо знайдено і валідно
-            current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            worksheet.update_cell(cell.row, ENTRY_TIMESTAMP_COL_B_NUM, current_datetime)
-            logger.info(f"Авто '{plate_number}' знайдено в рядку {cell.row}. Час в'їзду оновлено: {current_datetime}.")
+        Args:
+            spreadsheet_url (str): URL Google Таблиці.
+            credentials_file (str): Шлях до файлу облікових даних JSON.
+            scopes (List[str]): Список областей доступу для Google API.
+            vehicles_sheet_name (str): Назва основного аркуша в таблиці.
+        """
+        self._logger = logging.getLogger(f"{__name__}.SheetHandler")
+
+        self.spreadsheet_url = spreadsheet_url
+        self.credentials_file = credentials_file
+        self.scopes = scopes if scopes is not None else DEFAULT_SCOPES  # Використовуємо копію списку за замовчуванням
+        self.vehicles_sheet_name = vehicles_sheet_name
+
+        self._client: Optional[gspread.Client] = None
+        self._active_worksheet: Optional[gspread.Worksheet] = None  # Можна кешувати активний аркуш
+
+        if self.spreadsheet_url == 'YOUR_SPREADSHEET_URL_HERE':
+            self._logger.critical("URL Google Таблиці не встановлено! Будь ласка, встановіть spreadsheet_url.")
+            # Можна кинути виняток або залишити як є, але методи не працюватимуть
+            # raise ValueError("URL Google Таблиці не встановлено.")
+
+        # Спроба підключитися при ініціалізації
+        self._connect_and_authorize()
+
+    def _connect_and_authorize(self) -> bool:
+        """Встановлює з'єднання та авторизується з Google Sheets API."""
+        if self._client:  # Якщо клієнт вже існує
             return True
-        else:
-            logger.info(
-                f"Номер '{plate_number}' не знайдено (або не в діапазоні даних) в стовпці A аркуша '{VEHICLES_SHEET_NAME}'.")
+
+        self._logger.info(f"Спроба підключення до Google Sheets API через {self.credentials_file}...")
+        try:
+            # Перевірка існування файлу облікових даних
+            if not os.path.exists(self.credentials_file):
+                self._logger.error(
+                    f"Файл облікових даних '{self.credentials_file}' не знайдено за шляхом: {os.path.abspath(self.credentials_file)}")
+                # Спробувати знайти у директорії config/, якщо шлях не абсолютний
+                config_dir_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config",
+                                               self.credentials_file)
+                if os.path.exists(config_dir_path):
+                    self._logger.info(f"Знайдено файл облікових даних у config/: {config_dir_path}")
+                    self.credentials_file = config_dir_path
+                else:
+                    self._logger.error(f"Файл облікових даних також не знайдено у: {config_dir_path}")
+                    return False
+
+            creds = ServiceAccountCredentials.from_json_keyfile_name(self.credentials_file, self.scopes)
+            self._client = gspread.authorize(creds)
+            self._logger.info("Успішно підключено та авторизовано з Google Sheets API.")
+            return True
+        except FileNotFoundError:  # Ця помилка вже оброблена вище, але для повноти
+            self._logger.error(f"Файл облікових даних '{self.credentials_file}' не знайдено (повторна перевірка).")
             return False
-    except Exception as e:
-        logger.error(f"Помилка пошуку/оновлення авто '{plate_number}' для в'їзду: {e}", exc_info=True)
-        return False
+        except Exception as e:
+            self._logger.error(f"Не вдалося авторизуватися або підключитися до Google Sheets API: {e}", exc_info=True)
+            return False
 
+    def _get_worksheet(self, sheet_name: Optional[str] = None) -> Optional[gspread.Worksheet]:
+        """
+        Допоміжна функція для отримання конкретного аркуша.
+        Якщо sheet_name не вказано, використовує self.vehicles_sheet_name.
+        """
+        if not self._client:
+            self._logger.warning("Клієнт Google Sheets не ініціалізовано. Спроба повторного підключення.")
+            if not self._connect_and_authorize():
+                return None
 
-def add_unauthorized_attempt(plate_number: str) -> bool:
-    """
-    Додає запис про неавторизовану спробу в'їзду в аркуш 'Vehicles' (Стовпці D та E).
-    """
-    worksheet = _get_worksheet(VEHICLES_SHEET_NAME)
-    if not worksheet: return False
+        target_sheet_name = sheet_name if sheet_name is not None else self.vehicles_sheet_name
 
-    try:
-        current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Знаходимо наступний порожній рядок у стовпці D, починаючи з UNAUTHORIZED_DATA_START_ROW
-        col_d_values = worksheet.col_values(UNAUTHORIZED_PLATE_COL_D_NUM)
-        next_row_to_write = UNAUTHORIZED_DATA_START_ROW
+        # Перевірка, чи ми вже маємо цей аркуш (просте кешування)
+        if self._active_worksheet and self._active_worksheet.title == target_sheet_name:
+            return self._active_worksheet
 
-        # Починаємо пошук з індексу, що відповідає UNAUTHORIZED_DATA_START_ROW
-        start_index_for_search = UNAUTHORIZED_DATA_START_ROW - 1
-        if start_index_for_search < len(col_d_values):
-            for i in range(start_index_for_search, len(col_d_values)):
-                if not col_d_values[i]:  # Якщо комірка порожня
-                    next_row_to_write = i + 1  # gspread рядки 1-індексовані
-                    break
-            else:  # Якщо всі комірки до кінця col_d_values заповнені
-                next_row_to_write = len(col_d_values) + 1
-        # Якщо col_d_values коротший за start_index_for_search, next_row_to_write залишається UNAUTHORIZED_DATA_START_ROW
+        try:
+            if not self.spreadsheet_url or self.spreadsheet_url == 'YOUR_SPREADSHEET_URL_HERE':
+                self._logger.error("URL таблиці не налаштовано. Встановіть значення spreadsheet_url.")
+                return None
 
-        # Переконуємося, що не пишемо вище за стартовий рядок
-        if next_row_to_write < UNAUTHORIZED_DATA_START_ROW:
+            spreadsheet = self._client.open_by_url(self.spreadsheet_url)
+            worksheet = spreadsheet.worksheet(target_sheet_name)
+            self._active_worksheet = worksheet  # Кешуємо
+            return worksheet
+        except gspread.exceptions.SpreadsheetNotFound:
+            self._logger.error(f"Таблицю не знайдено за URL: {self.spreadsheet_url}.")
+        except gspread.exceptions.WorksheetNotFound:
+            self._logger.error(f"Аркуш '{target_sheet_name}' не знайдено в таблиці.")
+        except Exception as e:
+            self._logger.error(f"Помилка відкриття аркуша '{target_sheet_name}': {e}", exc_info=True)
+
+        self._active_worksheet = None  # Скидаємо кеш у разі помилки
+        return None
+
+    def find_vehicle_and_update_entry_time(self, plate_number: str) -> bool:
+        """
+        Знаходить номерний знак в аркуші (Стовпець A).
+        Якщо знайдено, оновлює час останнього в'їзду в Стовпці B.
+        """
+        worksheet = self._get_worksheet()  # Використовує self.vehicles_sheet_name
+        if not worksheet:
+            self._logger.error(
+                f"Не вдалося отримати аркуш '{self.vehicles_sheet_name}' для пошуку авто '{plate_number}'.")
+            return False
+
+        try:
+            self._logger.debug(f"Пошук номера '{plate_number}' для в'їзду в '{self.vehicles_sheet_name}'.")
+            cell: Optional[gspread.Cell] = None
+            try:
+                cells_found = worksheet.findall(plate_number, in_column=ENTRY_PLATE_COL_A_NUM)
+                valid_cells = [c for c in cells_found if c.row >= ENTRY_DATA_START_ROW]
+                if valid_cells:
+                    cell = valid_cells[0]
+            except gspread.exceptions.CellNotFound:
+                pass  # findall поверне порожній список
+
+            if cell:
+                current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                worksheet.update_cell(cell.row, ENTRY_TIMESTAMP_COL_B_NUM, current_datetime)
+                self._logger.info(
+                    f"Авто '{plate_number}' знайдено в рядку {cell.row}. Час в'їзду оновлено: {current_datetime}.")
+                return True
+            else:
+                self._logger.info(
+                    f"Номер '{plate_number}' не знайдено (або не в діапазоні даних) в стовпці A аркуша '{self.vehicles_sheet_name}'.")
+                return False
+        except Exception as e:
+            self._logger.error(f"Помилка пошуку/оновлення авто '{plate_number}' для в'їзду: {e}", exc_info=True)
+            return False
+
+    def add_unauthorized_attempt(self, plate_number: str) -> bool:
+        """
+        Додає запис про неавторизовану спробу в'їзду (Стовпці D та E).
+        """
+        worksheet = self._get_worksheet()
+        if not worksheet:
+            self._logger.error(
+                f"Не вдалося отримати аркуш '{self.vehicles_sheet_name}' для логування неавторизованої спроби '{plate_number}'.")
+            return False
+
+        try:
+            current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Знаходимо наступний порожній рядок
+            col_d_values = worksheet.col_values(UNAUTHORIZED_PLATE_COL_D_NUM)
             next_row_to_write = UNAUTHORIZED_DATA_START_ROW
 
-        worksheet.update_cell(next_row_to_write, UNAUTHORIZED_PLATE_COL_D_NUM, plate_number)
-        worksheet.update_cell(next_row_to_write, UNAUTHORIZED_TIMESTAMP_COL_E_NUM, current_datetime)
+            start_index_for_search = UNAUTHORIZED_DATA_START_ROW - 1
+            if start_index_for_search < len(col_d_values):
+                for i in range(start_index_for_search, len(col_d_values)):
+                    if not col_d_values[i]:
+                        next_row_to_write = i + 1
+                        break
+                else:
+                    next_row_to_write = len(col_d_values) + 1
 
-        logger.info(f"Неавторизовану спробу '{plate_number}' залоговано о {current_datetime} "
-                    f"в аркуші '{VEHICLES_SHEET_NAME}', рядок {next_row_to_write} (стовпці D,E).")
-        return True
-    except Exception as e:
-        logger.error(f"Помилка додавання неавторизованої спроби для '{plate_number}': {e}", exc_info=True)
-        return False
+            if next_row_to_write < UNAUTHORIZED_DATA_START_ROW:  # Перестраховка
+                next_row_to_write = UNAUTHORIZED_DATA_START_ROW
 
+            worksheet.update_cell(next_row_to_write, UNAUTHORIZED_PLATE_COL_D_NUM, plate_number)
+            worksheet.update_cell(next_row_to_write, UNAUTHORIZED_TIMESTAMP_COL_E_NUM, current_datetime)
 
-def log_vehicle_exit(plate_number: str) -> bool:
-    """
-    Записує номерний знак та час виїзду автомобіля в аркуш 'Vehicles' (Стовпці G та H).
-    """
-    worksheet = _get_worksheet(VEHICLES_SHEET_NAME)
-    if not worksheet: return False
+            self._logger.info(f"Неавторизовану спробу '{plate_number}' залоговано о {current_datetime} "
+                              f"в аркуші '{self.vehicles_sheet_name}', рядок {next_row_to_write} (стовпці D,E).")
+            return True
+        except Exception as e:
+            self._logger.error(f"Помилка додавання неавторизованої спроби для '{plate_number}': {e}", exc_info=True)
+            return False
 
-    try:
-        current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def log_vehicle_exit(self, plate_number: str) -> bool:
+        """
+        Записує номерний знак та час виїзду автомобіля (Стовпці G та H).
+        """
+        worksheet = self._get_worksheet()
+        if not worksheet:
+            self._logger.error(
+                f"Не вдалося отримати аркуш '{self.vehicles_sheet_name}' для логування виїзду '{plate_number}'.")
+            return False
 
-        # Знаходимо наступний порожній рядок у стовпці G, починаючи з EXIT_DATA_START_ROW
-        col_g_values = worksheet.col_values(EXIT_PLATE_COL_G_NUM)
-        next_row_to_write = EXIT_DATA_START_ROW
-
-        start_index_for_search = EXIT_DATA_START_ROW - 1
-        if start_index_for_search < len(col_g_values):
-            for i in range(start_index_for_search, len(col_g_values)):
-                if not col_g_values[i]:
-                    next_row_to_write = i + 1
-                    break
-            else:
-                next_row_to_write = len(col_g_values) + 1
-
-        if next_row_to_write < EXIT_DATA_START_ROW:
+        try:
+            current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            col_g_values = worksheet.col_values(EXIT_PLATE_COL_G_NUM)
             next_row_to_write = EXIT_DATA_START_ROW
 
-        worksheet.update_cell(next_row_to_write, EXIT_PLATE_COL_G_NUM, plate_number)
-        worksheet.update_cell(next_row_to_write, EXIT_TIMESTAMP_COL_H_NUM, current_datetime)
+            start_index_for_search = EXIT_DATA_START_ROW - 1
+            if start_index_for_search < len(col_g_values):
+                for i in range(start_index_for_search, len(col_g_values)):
+                    if not col_g_values[i]:
+                        next_row_to_write = i + 1
+                        break
+                else:
+                    next_row_to_write = len(col_g_values) + 1
 
-        logger.info(f"Виїзд автомобіля залоговано: Номер '{plate_number}', Час {current_datetime} "
-                    f"в аркуші '{VEHICLES_SHEET_NAME}', рядок {next_row_to_write} (стовпці G,H).")
-        return True
-    except Exception as e:
-        logger.error(f"Помилка логування виїзду авто для номера '{plate_number}': {e}", exc_info=True)
-        return False
+            if next_row_to_write < EXIT_DATA_START_ROW:  # Перестраховка
+                next_row_to_write = EXIT_DATA_START_ROW
+
+            worksheet.update_cell(next_row_to_write, EXIT_PLATE_COL_G_NUM, plate_number)
+            worksheet.update_cell(next_row_to_write, EXIT_TIMESTAMP_COL_H_NUM, current_datetime)
+
+            self._logger.info(f"Виїзд автомобіля залоговано: Номер '{plate_number}', Час {current_datetime} "
+                              f"в аркуші '{self.vehicles_sheet_name}', рядок {next_row_to_write} (стовпці G,H).")
+            return True
+        except Exception as e:
+            self._logger.error(f"Помилка логування виїзду авто для номера '{plate_number}': {e}", exc_info=True)
+            return False
 
 
-# --- Головний блок для тестування модуля ---
+# --- Блок для тестування модуля ---
 if __name__ == '__main__':
     # Налаштування базового логування для виводу в консоль під час тестування
-    if not logger.hasHandlers():
-        console_handler = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(name)s - [%(levelname)s] - %(module)s:%(lineno)d - %(message)s')
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-        logger.setLevel(logging.DEBUG)
-        # Щоб бачити логи gspread, можна додати:
-        # logging.getLogger('gspread').setLevel(logging.DEBUG)
+    # У реальному проекті це буде робитися централізовано через logger_config.py
+    if not logging.getLogger().hasHandlers():  # Перевіряємо, чи вже є обробники
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s - %(name)s - [%(levelname)s] - %(module)s:%(lineno)d - %(message)s',
+            handlers=[logging.StreamHandler()]  # Тільки консоль для тесту модуля
+        )
 
-    logger.info("--- Тестування модуля sheets.py ---")
+    test_logger = logging.getLogger(__name__)  # Використовуємо __name__ для коректного імені логгера
+    test_logger.info("--- Тестування модуля sheet_handler.py ---")
 
-    if YOUR_SPREADSHEET_URL == 'YOUR_SPREADSHEET_URL_HERE':
-        logger.critical("КРИТИЧНО: YOUR_SPREADSHEET_URL не встановлено у sheets.py.")
-    elif not os.path.exists(CREDENTIALS_FILE):
-        logger.critical(
-            f"КРИТИЧНО: Файл облікових даних '{CREDENTIALS_FILE}' не знайдено: {os.path.abspath(CREDENTIALS_FILE)}.")
+    # !!! ВАЖЛИВО: Для тестування потрібно вказати реальний URL вашої таблиці
+    # та переконатися, що файл credentials.json існує і налаштований.
+    TEST_SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1gz5snNdG06sPL0_w2zyWtca3BiAQ7ru8I93LqPVjrC4/edit?gid=0#gid=0'  # ЗАМІНІТЬ НА ВАШ URL
+    TEST_CREDENTIALS_FILE = 'config/credentials.json'  # Припускаємо, що він у config/ відносно кореня проекту
+
+    if TEST_SPREADSHEET_URL == 'YOUR_SPREADSHEET_URL_HERE':
+        test_logger.critical("КРИТИЧНО: TEST_SPREADSHEET_URL не встановлено для тестування sheet_handler.py.")
+    elif not os.path.exists(TEST_CREDENTIALS_FILE):
+        abs_path = os.path.abspath(TEST_CREDENTIALS_FILE)
+        test_logger.critical(
+            f"КРИТИЧНО: Файл облікових даних '{TEST_CREDENTIALS_FILE}' не знайдено за шляхом: {abs_path}.")
     else:
-        logger.info(f"Використовується URL таблиці: {YOUR_SPREADSHEET_URL}")
-        logger.info(f"Очікується файл облікових даних: {os.path.abspath(CREDENTIALS_FILE)}")
+        test_logger.info(f"Використовується URL таблиці: {TEST_SPREADSHEET_URL}")
+        test_logger.info(f"Очікується файл облікових даних: {os.path.abspath(TEST_CREDENTIALS_FILE)}")
 
-        client_test = _get_sheet_client()
-        if not client_test:
-            logger.error("Не вдалося отримати клієнт для Google Sheets. Подальші тести неможливі.")
+        # Створюємо екземпляр SheetHandler
+        handler = SheetHandler(
+            spreadsheet_url=TEST_SPREADSHEET_URL,
+            credentials_file=TEST_CREDENTIALS_FILE
+            # Інші параметри (scopes, sheet_name) будуть використані за замовчуванням
+        )
+
+        if not handler._client:  # Перевіряємо, чи вдалося підключитися
+            test_logger.error("Не вдалося отримати клієнт для Google Sheets. Подальші тести неможливі.")
         else:
-            logger.info("Клієнт для Google Sheets успішно отримано.")
+            test_logger.info("Клієнт для Google Sheets успішно отримано.")
 
             # --- Тест: Пошук та оновлення в'їзду ---
-            # "EXISTING_PLATE" номер, що точно є у стовпці A
-            test_plate_entry_allowed = "AA1111AA"
-            logger.info(f"\nТест 1: Пошук та оновлення в'їзду для '{test_plate_entry_allowed}'")
-            if find_vehicle_and_update_entry_time(test_plate_entry_allowed):
-                logger.info(f"  УСПІХ: Час в'їзду для '{test_plate_entry_allowed}' оновлено.")
+            # !!! ЗАМІНІТЬ "EXISTING_PLATE_IN_COL_A" на номер, що ТОЧНО є у Стовпці A (з 3-го рядка) !!!
+            test_plate_entry_allowed = "EXISTING_PLATE_IN_COL_A"
+            test_logger.info(f"\nТест 1: Пошук та оновлення в'їзду для '{test_plate_entry_allowed}'")
+            if handler.find_vehicle_and_update_entry_time(test_plate_entry_allowed):
+                test_logger.info(f"  УСПІХ: Час в'їзду для '{test_plate_entry_allowed}' оновлено.")
             else:
-                logger.warning(
+                test_logger.warning(
                     f"  ПОМИЛКА/НЕ ЗНАЙДЕНО: '{test_plate_entry_allowed}'. Перевірте номер та права доступу.")
 
             # --- Тест: Спроба знайти неіснуючий номер для в'їзду ---
-            test_plate_entry_non_existent = f"NONEXISTENT_{int(time.time()) % 1000}"
-            logger.info(f"\nТест 2: Пошук неіснуючого номера '{test_plate_entry_non_existent}' для в'їзду")
-            if not find_vehicle_and_update_entry_time(test_plate_entry_non_existent):
-                logger.info(f"  УСПІХ (очікувано): Номер '{test_plate_entry_non_existent}' не знайдено.")
+            # Генеруємо унікальний неіснуючий номер
+            import time as time_module  # Щоб уникнути конфлікту з datetime.time
+
+            test_plate_entry_non_existent = f"NONEXISTENT_{int(time_module.time()) % 10000}"
+            test_logger.info(f"\nТест 2: Пошук неіснуючого номера '{test_plate_entry_non_existent}' для в'їзду")
+            if not handler.find_vehicle_and_update_entry_time(test_plate_entry_non_existent):
+                test_logger.info(f"  УСПІХ (очікувано): Номер '{test_plate_entry_non_existent}' не знайдено.")
             else:
-                logger.error(f"  ПОМИЛКА (неочікувано): Номер '{test_plate_entry_non_existent}' знайдено.")
+                test_logger.error(f"  ПОМИЛКА (неочікувано): Номер '{test_plate_entry_non_existent}' знайдено.")
 
             # --- Тест: Додавання неавторизованої спроби ---
-            test_plate_unauthorized = f"UNAUTH_{int(time.time()) % 1000}"
-            logger.info(f"\nТест 3: Логування неавторизованої спроби для '{test_plate_unauthorized}'")
-            if add_unauthorized_attempt(test_plate_unauthorized):
-                logger.info(f"  УСПІХ: Спроба '{test_plate_unauthorized}' залогована (Стовпці D,E).")
+            test_plate_unauthorized = f"UNAUTH_{int(time_module.time()) % 10000}"
+            test_logger.info(f"\nТест 3: Логування неавторизованої спроби для '{test_plate_unauthorized}'")
+            if handler.add_unauthorized_attempt(test_plate_unauthorized):
+                test_logger.info(f"  УСПІХ: Спроба '{test_plate_unauthorized}' залогована (Стовпці D,E).")
             else:
-                logger.warning(f"  ПОМИЛКА: Не вдалося залогувати спробу '{test_plate_unauthorized}'.")
+                test_logger.warning(f"  ПОМИЛКА: Не вдалося залогувати спробу '{test_plate_unauthorized}'.")
 
-            time.sleep(1)  # Щоб уникнути однакових міток часу
-            test_plate_unauthorized_2 = f"UNAUTH_NEXT_{int(time.time()) % 1000}"
-            logger.info(f"\nТест 4: Логування ще однієї неавторизованої спроби '{test_plate_unauthorized_2}'")
-            if add_unauthorized_attempt(test_plate_unauthorized_2):
-                logger.info(f"  УСПІХ: Спроба '{test_plate_unauthorized_2}' залогована.")
+            time_module.sleep(1)  # Щоб уникнути однакових міток часу
+            test_plate_unauthorized_2 = f"UNAUTH_NEXT_{int(time_module.time()) % 10000}"
+            test_logger.info(f"\nТест 4: Логування ще однієї неавторизованої спроби '{test_plate_unauthorized_2}'")
+            if handler.add_unauthorized_attempt(test_plate_unauthorized_2):
+                test_logger.info(f"  УСПІХ: Спроба '{test_plate_unauthorized_2}' залогована.")
             else:
-                logger.warning(f"  ПОМИЛКА: Не вдалося залогувати спробу '{test_plate_unauthorized_2}'.")
+                test_logger.warning(f"  ПОМИЛКА: Не вдалося залогувати спробу '{test_plate_unauthorized_2}'.")
 
             # --- Тест: Логування виїзду автомобіля ---
-            test_plate_exit = f"EXITCAR_{int(time.time()) % 1000}"
-            logger.info(f"\nТест 5: Логування виїзду для '{test_plate_exit}'")
-            if log_vehicle_exit(test_plate_exit):
-                logger.info(f"  УСПІХ: Виїзд '{test_plate_exit}' залоговано (Стовпці G,H).")
+            test_plate_exit = f"EXITCAR_{int(time_module.time()) % 10000}"
+            test_logger.info(f"\nТест 5: Логування виїзду для '{test_plate_exit}'")
+            if handler.log_vehicle_exit(test_plate_exit):
+                test_logger.info(f"  УСПІХ: Виїзд '{test_plate_exit}' залоговано (Стовпці G,H).")
             else:
-                logger.warning(f"  ПОМИЛКА: Не вдалося залогувати виїзд '{test_plate_exit}'.")
+                test_logger.warning(f"  ПОМИЛКА: Не вдалося залогувати виїзд '{test_plate_exit}'.")
 
-            time.sleep(1)
-            test_plate_exit_2 = f"EXITNEXT_{int(time.time()) % 1000}"
-            logger.info(f"\nТест 6: Логування ще одного виїзду '{test_plate_exit_2}'")
-            if log_vehicle_exit(test_plate_exit_2):
-                logger.info(f"  УСПІХ: Виїзд '{test_plate_exit_2}' залоговано.")
+            time_module.sleep(1)
+            test_plate_exit_2 = f"EXITNEXT_{int(time_module.time()) % 10000}"
+            test_logger.info(f"\nТест 6: Логування ще одного виїзду '{test_plate_exit_2}'")
+            if handler.log_vehicle_exit(test_plate_exit_2):
+                test_logger.info(f"  УСПІХ: Виїзд '{test_plate_exit_2}' залоговано.")
             else:
-                logger.warning(f"  ПОМИЛКА: Не вдалося залогувати виїзд '{test_plate_exit_2}'.")
+                test_logger.warning(f"  ПОМИЛКА: Не вдалося залогувати виїзд '{test_plate_exit_2}'.")
 
-    logger.info("\n--- Завершено тестування модуля sheets.py ---")
-    logger.info("Будь ласка, перевірте вашу Google Таблицю для верифікації результатів.")
+    test_logger.info("\n--- Завершено тестування модуля sheet_handler.py ---")
+    test_logger.info("Будь ласка, перевірте вашу Google Таблицю для верифікації результатів.")

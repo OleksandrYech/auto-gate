@@ -12,7 +12,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 try:
     from utils.logger_config import setup_global_logging
     from core.camera_manager import CameraManager, DEFAULT_ENTRY_CAM_MODEL_SUBSTRING, DEFAULT_EXIT_CAM_MODEL_SUBSTRING
-    from core.sensor_manager import SensorManager
+    from core.sensors_manager import SensorManager
     from core.sheet_handler import SheetHandler
     from core.gate_controller import GateController
     from core.cv_processor import CVProcessor
