@@ -5,10 +5,9 @@ import signal
 import sys
 import threading
 import time
+from typing import Dict, Any  # Додано для type hinting конфігурацій
 
 # --- Налаштування шляхів для імпорту ---
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
 try:
     from utils.logger_config import setup_global_logging
     from core.camera_manager import CameraManager, DEFAULT_ENTRY_CAM_MODEL_SUBSTRING, DEFAULT_EXIT_CAM_MODEL_SUBSTRING
@@ -18,164 +17,188 @@ try:
     from core.cv_processor import CVProcessor
     from core.vehicle_event_handler import VehicleEventHandler
 except ImportError as e:
-    print(f"Критична помилка імпорту модулів: {e}")
-    print("Переконайтеся, що всі необхідні файли (.py) знаходяться у правильних директоріях (core/, utils/)")
-    print(f"Поточний робочий каталог: {os.getcwd()}")
-    print(f"Шляхи пошуку Python: {sys.path}")
-    sys.exit(1)
+    current_script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root_guess = os.path.dirname(current_script_dir)
+    if project_root_guess not in sys.path:
+        sys.path.insert(0, project_root_guess)
+
+    # Повторна спроба імпорту
+    try:
+        from utils.logger_config import setup_global_logging
+        from core.camera_manager import CameraManager, DEFAULT_ENTRY_CAM_MODEL_SUBSTRING, \
+            DEFAULT_EXIT_CAM_MODEL_SUBSTRING
+        from core.sensors_manager import SensorManager
+        from core.sheet_handler import SheetHandler
+        from core.gate_controller import GateController
+        from core.cv_processor import CVProcessor
+        from core.vehicle_event_handler import VehicleEventHandler
+    except ImportError as final_e:
+        print(f"Критична помилка імпорту модулів: {final_e}")
+        print("Переконайтеся, що всі необхідні файли (.py) знаходяться у правильних директоріях (core/, utils/)")
+        print(f"Поточний робочий каталог: {os.getcwd()}")
+        print(f"Шляхи пошуку Python: {sys.path}")
+        sys.exit(1)
 
 # --- Глобальні константи та конфігурація ---
 
-# Шляхи (відносно кореня проекту, де знаходиться main.py)
+# Шляхи (відносно кореня проекту)
 CONFIG_DIR = "config"
 MODELS_DIR = "models"
-LOGS_DIR = "logs"  # Використовується logger_config
-CAPTURED_IMAGES_BASE_PATH = "captured_images"  # Для VehicleEventHandler та CVProcessor
+LOGS_DIR = "logs"
+CAPTURED_IMAGES_BASE_PATH = "captured_images"
 
 ROI_CONFIG_PATH = os.path.join(CONFIG_DIR, "roi_config.json")
+SHEETS_CREDENTIALS_PATH = os.path.join(CONFIG_DIR, "credentials.json")
+
 MOBILENET_SSD_PATH = os.path.join(MODELS_DIR, "ssd_mobilenetv1.onnx")
 LICENSE_PLATE_MODEL_PATH = os.path.join(MODELS_DIR, "license.onnx")
-OCR_MODEL_PATH = os.path.join(MODELS_DIR, "ocr.pt")  # Використовуємо .pt для OCR
+OCR_MODEL_PATH = os.path.join(MODELS_DIR, "ocr.pt")
 
-# Налаштування камер (приклади, можна винести в конфігураційний файл)
-CAMERA_ENTRY_CONFIG = {
+# Налаштування камер
+CAMERA_ENTRY_CONFIG: Dict[str, Any] = {
     "name": "EntryCamera", "resolution": (1920, 1080), "hflip": False, "vflip": True
 }
-CAMERA_EXIT_CONFIG = {
+CAMERA_EXIT_CONFIG: Dict[str, Any] = {
     "name": "ExitCamera", "resolution": (1280, 720), "hflip": False, "vflip": True
 }
+# Підрядки для пошуку моделей камер (можна змінити, якщо ваші камери інші)
+CAM_ENTRY_MODEL_SUB = DEFAULT_ENTRY_CAM_MODEL_SUBSTRING
+CAM_EXIT_MODEL_SUB = DEFAULT_EXIT_CAM_MODEL_SUBSTRING
 
 # Піни GPIO (BCM нумерація)
-REED_SWITCH_PIN = 22
-ULTRASONIC_ENTRY_TRIGGER_PIN = 23
-ULTRASONIC_ENTRY_ECHO_PIN = 24
-# ULTRASONIC_EXIT_TRIGGER_PIN = ... # Якщо є окремий датчик
-# ULTRASONIC_EXIT_ECHO_PIN = ...  # Якщо є окремий
+REED_SWITCH_PIN: int = 22
+ULTRASONIC_ENTRY_TRIGGER_PIN: int = 23
+ULTRASONIC_ENTRY_ECHO_PIN: int = 24
 
-OPEN_RELAY_PIN = 17
-CLOSE_RELAY_PIN = 27
+OPEN_RELAY_PIN: int = 17
+CLOSE_RELAY_PIN: int = 27
+RELAY_PULSE_DURATION_S: float = 0.5  # Для GateController
 
 # Параметри для моделей CV
-CV_VEHICLE_MODEL_INPUT_SIZE = (300, 300)  # (width, height) для MobileNet SSD
-CV_OCR_IMG_SIZE_ULTRALYTICS = 320  # Розмір для YOLO().predict() для OCR
+CV_VEHICLE_MODEL_INPUT_SIZE: tuple = (300, 300)
+CV_OCR_IMG_SIZE_ULTRALYTICS: int = 320
 
-# Таймери та налаштування для VehicleEventHandler
-VEH_SHEETS_ANTIDUPLICATE_DELAY_S = 60
-VEH_PASSAGE_CONFIRMATION_TIMEOUT_S = 20
-VEH_POLL_INTERVAL_IDLE_S = 1.0  # Зменшено для швидшої реакції
-VEH_POLL_INTERVAL_GATE_CLOSING_S = 0.3
+# Таймери та налаштування для VehicleEventHandler (з ваших уточнених сценаріїв)
+VEH_CONFIG: Dict[str, Any] = {
+    "sheets_antiduplicate_delay_s": 60,
+    "reed_open_timeout_s": 15,  # Таймаут очікування відкриття герконом (сценарій VEH)
+    "reed_open_retries": 1,  # Кількість повторів відкриття (сценарій VEH)
+    "passage_confirmation_timeout_s": 20,  # Таймаут очікування проїзду через УЗД (після появи в зоні)
+    "ultrasonic_passage_threshold": 0.3,  # Поріг УЗД для "в проїзді" / "проїзд вільний"
+    "auto_close_timer_duration_s": 4,  # 4-секундний таймер на закриття (сценарій VEH)
+    "reed_close_timeout_s": 5,  # Таймаут очікування закриття герконом (сценарій VEH)
+    "reed_close_retries": 1,  # Кількість повторів закриття (сценарій VEH)
+    "gate_finish_closing_delay_s": 10,  # Фінальна затримка після закриття (сценарій VEH)
+    "poll_interval_idle_s": 1.0,
+    "poll_interval_gate_closing_s": 0.3
+}
 
-# Таймер для GateController
-GATE_AUTO_CLOSE_TIMEOUT_S = 30
+# Налаштування для GateController
+GATE_CTRL_CONFIG: Dict[str, Any] = {
+    "relay_pulse_duration_s": RELAY_PULSE_DURATION_S,
+    "auto_close_timeout_s": VEH_CONFIG["auto_close_timer_duration_s"],
+    # Внутрішній таймер GC тепер синхронізований з VEH
+    "closing_obstruction_threshold_m": VEH_CONFIG["ultrasonic_passage_threshold"],  # Використовуємо той самий поріг
+    "reed_confirmation_timeout_s": 5  # Короткий таймаут для внутрішньої перевірки GC (можна 0, якщо VEH все контролює)
+}
 
 # Подія для коректного завершення роботи
 shutdown_event = threading.Event()
 
 
-# --- Налаштування логування ---
-# setup_global_logging() викликається в блоці if __name__ == "__main__"
-
 # --- Обробник сигналів ---
 def signal_handler(sig, frame):
-    logger = logging.getLogger(__name__)  # Отримуємо логгер тут
+    logger = logging.getLogger(__name__)
     logger.warning(f"Отримано сигнал {signal.Signals(sig).name}. Завершення роботи...")
     shutdown_event.set()
 
 
 # --- Головна функція програми ---
 def main_application():
-    logger = logging.getLogger(__name__)  # Логгер для цієї функції
+    logger = logging.getLogger(__name__)
     logger.info("Запуск автоматизованої системи керування воротами...")
 
     cam_manager = None
     sensor_mgr = None
     gate_ctrl = None
-    vehicle_event_hndl = None  # Визначаємо тут, щоб був доступний у finally
+    vehicle_event_hndl = None
 
     try:
         # 1. Створення необхідних директорій
-        os.makedirs(CAPTURED_IMAGES_BASE_PATH, exist_ok=True)
-        os.makedirs(os.path.join(CAPTURED_IMAGES_BASE_PATH, "entry"), exist_ok=True)
-        os.makedirs(os.path.join(CAPTURED_IMAGES_BASE_PATH, "exit"), exist_ok=True)
-        os.makedirs(os.path.join(CAPTURED_IMAGES_BASE_PATH, "cv_debug", "entry"), exist_ok=True)
-        os.makedirs(os.path.join(CAPTURED_IMAGES_BASE_PATH, "cv_debug", "exit"), exist_ok=True)
-        # Директорія для логів створюється в logger_config.py
+        os.makedirs(CAPTURED_IMAGES_BASE_PATH, exist_ok=True)  # Головна папка
 
         # 2. Ініціалізація компонентів
         logger.info("Ініціалізація CameraManager...")
         cam_manager = CameraManager(
-            entry_cam_model_sub=DEFAULT_ENTRY_CAM_MODEL_SUBSTRING,
-            exit_cam_model_sub=DEFAULT_EXIT_CAM_MODEL_SUBSTRING,
+            entry_cam_model_sub=CAM_ENTRY_MODEL_SUB,
+            exit_cam_model_sub=CAM_EXIT_MODEL_SUB,
             entry_cam_config=CAMERA_ENTRY_CONFIG,
             exit_cam_config=CAMERA_EXIT_CONFIG,
             image_base_path=CAPTURED_IMAGES_BASE_PATH
         )
-        # Перевірка наявності камер (принаймні в'їзної)
         if not cam_manager.get_entry_camera() and not cam_manager.get_exit_camera():
             logger.critical("ЖОДНА з камер не ініціалізована. Система не може працювати. Завершення.")
             return
-        if not cam_manager.get_entry_camera():
-            logger.warning("Камера В'ЇЗДУ не ініціалізована. Функціонал в'їзду буде обмежений.")
-            # Можна або завершити роботу, або продовжити з обмеженим функціоналом
-        if not cam_manager.get_exit_camera():
-            logger.warning("Камера ВИЇЗДУ не ініціалізована. Функціонал виїзду буде обмежений.")
+        # Подальша логіка може адаптуватися, якщо одна з камер відсутня (всередині VehicleEventHandler)
 
         logger.info("Ініціалізація SensorManager...")
         sensor_mgr = SensorManager(
             reed_pin=REED_SWITCH_PIN,
             ultrasonic_entry_trigger_pin=ULTRASONIC_ENTRY_TRIGGER_PIN,
             ultrasonic_entry_echo_pin=ULTRASONIC_ENTRY_ECHO_PIN,
-            # Додайте сюди піни для УЗД виїзду, якщо вони є:
-            # ultrasonic_exit_trigger_pin=ULTRASONIC_EXIT_TRIGGER_PIN,
-            # ultrasonic_exit_echo_pin=ULTRASONIC_EXIT_ECHO_PIN
         )
 
         logger.info("Ініціалізація SheetHandler...")
-        sheet_hndl = SheetHandler()  # Використовує константи з модуля sheet_handler.py
+        sheet_hndl = SheetHandler(credentials_file=SHEETS_CREDENTIALS_PATH)
+        if not sheet_hndl._client:  # Проста перевірка успішності ініціалізації клієнта
+            logger.critical("SheetHandler не вдалося ініціалізувати клієнта Google Sheets. Завершення.")
+            return
 
         logger.info("Ініціалізація GateController...")
         gate_ctrl = GateController(
             sensor_manager_instance=sensor_mgr,
             open_relay_pin=OPEN_RELAY_PIN,
             close_relay_pin=CLOSE_RELAY_PIN,
-            auto_close_timeout_s=GATE_AUTO_CLOSE_TIMEOUT_S
+            relay_pulse_duration_s=GATE_CTRL_CONFIG["relay_pulse_duration_s"],
+            auto_close_timeout_s=GATE_CTRL_CONFIG["auto_close_timeout_s"],
+            closing_obstruction_threshold_m=GATE_CTRL_CONFIG["closing_obstruction_threshold_m"],
+            reed_confirmation_timeout_s=GATE_CTRL_CONFIG["reed_confirmation_timeout_s"]
         )
+        if not gate_ctrl.relays_initialized:
+            logger.critical("Реле в GateController не ініціалізовано. Завершення.")
+            return
 
         logger.info("Ініціалізація CVProcessor...")
-        # Перевірка існування файлів моделей
         for model_p in [MOBILENET_SSD_PATH, LICENSE_PLATE_MODEL_PATH, OCR_MODEL_PATH]:
             if not os.path.exists(model_p):
                 logger.critical(f"Файл моделі не знайдено: {model_p}. Завершення роботи.")
                 return
-        # Перевірка файлу ROI (він може бути створений roi_create.py, тому лише попередження)
         if not os.path.exists(ROI_CONFIG_PATH):
-            logger.warning(f"Файл конфігурації ROI не знайдено: {ROI_CONFIG_PATH}. "
-                           f"Буде використано обробку повного кадру, якщо ROI не буде створено.")
+            logger.warning(
+                f"Файл конфігурації ROI не знайдено: {ROI_CONFIG_PATH}. Буде використано обробку повного кадру.")
 
         cv_proc = CVProcessor(
             mobilenet_ssd_path=MOBILENET_SSD_PATH,
             license_model_path=LICENSE_PLATE_MODEL_PATH,
-            ocr_model_path=OCR_MODEL_PATH,  # Шлях до ocr.pt
+            ocr_model_path=OCR_MODEL_PATH,
             roi_config_path=ROI_CONFIG_PATH,
             vehicle_input_target_size=CV_VEHICLE_MODEL_INPUT_SIZE,
-            ocr_input_target_size_for_ultralytics=CV_OCR_IMG_SIZE_ULTRALYTICS
+            ocr_input_target_size_for_ultralytics=CV_OCR_IMG_SIZE_ULTRALYTICS,
+            # Можна також передати інші пороги з CVProcessor, якщо потрібно
+            vehicle_confidence_thresh=0.5,  # Приклад
+            plate_confidence_thresh=0.5,  # Приклад
+            ocr_confidence_thresh=0.3,  # Приклад
         )
 
         logger.info("Ініціалізація VehicleEventHandler...")
-        event_handler_config = {
-            "sheets_antiduplicate_delay_s": VEH_SHEETS_ANTIDUPLICATE_DELAY_S,
-            "passage_confirmation_timeout_s": VEH_PASSAGE_CONFIRMATION_TIMEOUT_S,
-            "poll_interval_idle_s": VEH_POLL_INTERVAL_IDLE_S,
-            "poll_interval_gate_closing_s": VEH_POLL_INTERVAL_GATE_CLOSING_S,
-        }
         vehicle_event_hndl = VehicleEventHandler(
-            camera_entry=cam_manager.get_entry_camera(),  # Може бути None
-            camera_exit=cam_manager.get_exit_camera(),  # Може бути None
+            camera_entry=cam_manager.get_entry_camera(),
+            camera_exit=cam_manager.get_exit_camera(),
             sensor_manager=sensor_mgr,
             sheet_handler=sheet_hndl,
             cv_processor=cv_proc,
             gate_controller=gate_ctrl,
-            config=event_handler_config
+            config=VEH_CONFIG  # Передаємо конфігурацію для VEH
         )
 
         # 3. Запуск VehicleEventHandler
@@ -185,30 +208,25 @@ def main_application():
         # 4. Головний цикл очікування
         logger.info("Система запущена. Натисніть Ctrl+C для завершення.")
         while not shutdown_event.is_set():
-            # Перевірка життєздатності потоків обробника (опціонально)
-            if vehicle_event_hndl.entry_thread and not vehicle_event_hndl.entry_thread.is_alive() \
-                    and vehicle_event_hndl.is_running:  # Перевіряємо is_running, щоб не логувати після штатної зупинки
-                logger.error("Потік обробки В'ЇЗДУ несподівано завершився!")
-                # Тут можна додати логіку перезапуску або аварійного завершення
-                # shutdown_event.set() # Наприклад, зупинити все
-            if vehicle_event_hndl.exit_thread and not vehicle_event_hndl.exit_thread.is_alive() \
-                    and vehicle_event_hndl.is_running:
-                logger.error("Потік обробки ВИЇЗДУ несподівано завершився!")
+            if vehicle_event_hndl.entry_thread and not vehicle_event_hndl.entry_thread.is_alive() and vehicle_event_hndl.is_running:
+                logger.error("Потік обробки В'ЇЗДУ несподівано завершився! Система може працювати некоректно.")
+                # Тут можна додати логіку зупинки всієї системи або спроби перезапуску
+                # shutdown_event.set()
+            if vehicle_event_hndl.exit_thread and not vehicle_event_hndl.exit_thread.is_alive() and vehicle_event_hndl.is_running:
+                logger.error("Потік обробки ВИЇЗДУ несподівано завершився! Система може працювати некоректно.")
                 # shutdown_event.set()
 
-            time.sleep(1)  # Головний потік може просто чекати
+            time.sleep(1)
 
     except Exception as e:
         logger.critical(f"Неперехоплена помилка в main_application: {e}", exc_info=True)
+        shutdown_event.set()
     finally:
         logger.info("Початок процедури коректного завершення роботи системи...")
 
-        # Сигналізуємо VehicleEventHandler про зупинку (якщо він був створений)
         if vehicle_event_hndl:
             logger.info("Зупинка VehicleEventHandler...")
-            vehicle_event_hndl.stop()  # Встановлює is_running = False
-
-            # Очікуємо завершення його потоків
+            vehicle_event_hndl.stop()
             if hasattr(vehicle_event_hndl, 'entry_thread') and vehicle_event_hndl.entry_thread.is_alive():
                 logger.info("Очікування завершення потоку В'ЇЗДУ...")
                 vehicle_event_hndl.entry_thread.join(timeout=5)
@@ -217,7 +235,6 @@ def main_application():
                 vehicle_event_hndl.exit_thread.join(timeout=5)
             logger.info("Потоки VehicleEventHandler завершено.")
 
-        # Очищення ресурсів інших компонентів
         if cam_manager:
             logger.info("Закриття камер...")
             cam_manager.close_all_cameras()
@@ -233,14 +250,9 @@ def main_application():
 
 # --- Точка входу програми ---
 if __name__ == "__main__":
-    # 1. Налаштування логування - має бути першим!
-    # Рівні можна передати як аргументи, якщо потрібно змінити стандартні з logger_config.py
     setup_global_logging()
-
-    # Отримуємо головний логгер для main.py (після налаштування)
     main_logger = logging.getLogger(__name__)
 
-    # 2. Налаштування обробників сигналів
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -248,7 +260,10 @@ if __name__ == "__main__":
 
     try:
         main_application()
+    except SystemExit:  # Дозволяємо SystemExit (наприклад, від sys.exit(1)) пройти
+        main_logger.info("Програма завершена через SystemExit.")
     except Exception as e_global:
-        main_logger.critical(f"Неперехоплений виняток на глобальному рівні: {e_global}", exc_info=True)
+        main_logger.critical(f"Неперехоплений виняток на глобальному рівні (if __name__ == '__main__'): {e_global}",
+                             exc_info=True)
     finally:
-        logging.shutdown()  # Закриваємо всі файлові дескриптори логування
+        logging.shutdown()
