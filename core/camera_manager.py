@@ -235,8 +235,8 @@ class CameraManager:
         os.makedirs(self.image_base_path, exist_ok=True)  # Створюємо директорію, якщо її немає
 
         # Налаштування за замовчуванням, якщо не передано
-        default_entry_cfg = {"name": "EntryCam", "resolution": (1920, 1080), "hflip": False, "vflip": False}
-        default_exit_cfg = {"name": "ExitCam", "resolution": (1280, 720), "hflip": False, "vflip": False}
+        default_entry_cfg = {"name": "EntryCam", "resolution": (1920, 1080), "hflip": True, "vflip": False}
+        default_exit_cfg = {"name": "ExitCam", "resolution": (1280, 720), "hflip": True, "vflip": False}
 
         cfg_entry = {**default_entry_cfg, **(entry_cam_config or {})}
         cfg_exit = {**default_exit_cfg, **(exit_cam_config or {})}
@@ -318,14 +318,14 @@ if __name__ == '__main__':
     entry_camera_settings = {
         "name": "TestEntryCam",
         "resolution": (640, 480),  # Нижча роздільна здатність для швидкого тесту
-        "hflip": False,
-        "vflip": True
+        "hflip": True,
+        "vflip": False
     }
     exit_camera_settings = {
         "name": "TestExitCam",
         "resolution": (640, 480),
         "hflip": True,
-        "vflip": False
+        "vflip": True
     }
 
     try:

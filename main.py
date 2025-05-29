@@ -39,10 +39,10 @@ OCR_MODEL_PATH = os.path.join(MODELS_DIR, "ocr.pt")  # Використовує�
 
 # Налаштування камер (приклади, можна винести в конфігураційний файл)
 CAMERA_ENTRY_CONFIG = {
-    "name": "EntryCamera", "resolution": (1920, 1080), "hflip": False, "vflip": False
+    "name": "EntryCamera", "resolution": (1920, 1080), "hflip": False, "vflip": True
 }
 CAMERA_EXIT_CONFIG = {
-    "name": "ExitCamera", "resolution": (1280, 720), "hflip": False, "vflip": False
+    "name": "ExitCamera", "resolution": (1280, 720), "hflip": False, "vflip": True
 }
 
 # Піни GPIO (BCM нумерація)

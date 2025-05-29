@@ -3,6 +3,7 @@ import time
 import logging
 import threading
 from gpiozero import OutputDevice  # Для керування реле
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +44,8 @@ class GateController:
 
         # Ініціалізація реле (для low-level реле active_high=False)
         try:
-            self.open_relay = OutputDevice(self.open_relay_pin, active_high=False, initial_value=True)
-            self.close_relay = OutputDevice(self.close_relay_pin, active_high=False, initial_value=True)
+            self.open_relay = OutputDevice(self.open_relay_pin, active_high=True, initial_value=True)
+            self.close_relay = OutputDevice(self.close_relay_pin, active_high=True, initial_value=True)
             self._logger.info(f"Реле ВІДКРИТТЯ на GPIO{self.open_relay_pin} (active_low).")
             self._logger.info(f"Реле ЗАКРИТТЯ на GPIO{self.close_relay_pin} (active_low).")
             self.relays_initialized = True
