@@ -1,0 +1,11 @@
+opencv-python
+numpy
+onnxruntime
+ultralytics
+gspread
+oauth2client
+RPi.GPIO
+gpiozero
+picamera2
+# sudo apt update
+# sudo apt install python3-pigpio
