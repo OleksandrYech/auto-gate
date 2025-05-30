@@ -68,35 +68,35 @@ Markdown
 ## Структура Проекту
 
 auto-gate/
-   main.py                     # Головний скрипт запуску системи
-   config/
-      credentials.json          # Облікові дані для Google Sheets API
-      roi_config.json           # Конфігурація ROI (генерується roi_create.py)
-   core/
-      camera_manager.py         # Керування камерами
-      sensor_manager.py         # Керування датчиками (геркон, УЗД)
-      sheet_handler.py          # Взаємодія з Google Sheets
-      cv_processor.py           # Обробка зображень, МЛ моделі (детекція, OCR)
-      gate_controller.py        # Керування реле та логікою воріт
-      vehicle_event_handler.py  # Обробка сценаріїв в'їзду/виїзду
-   logs/
-      gate_system.log           # Файл логів роботи системи
-   models/
-      ssd_mobilenetv1.onnx      # Модель детекції автомобілів
-      license.onnx              # Модель детекції номерних знаків
-      ocr.pt                    # Модель розпізнавання символів (формат PyTorch)
-   tools/
-      roi_create.py             # Скрипт для ручного створення ROI
-   utils/
-      logger_config.py          # Централізоване налаштування логування
-      image_utils.py            # Допоміжні функції для роботи із зображеннями
-   captured_images/              # Збережені зображення (для відладки)
-      entry/
-      exit/
-      cv_debug/                 # Проміжні результати роботи CVProcessor
-   README.md                     # Цей файл
-   requirements.txt              # Список Python-залежностей
-
+main.py                     # Головний скрипт запуску системи
+config/
+   credentials.json          # Облікові дані для Google Sheets API
+   roi_config.json           # Конфігурація ROI (генерується roi_create.py)
+core/
+   camera_manager.py         # Керування камерами
+   sensor_manager.py         # Керування датчиками (геркон, УЗД)
+   sheet_handler.py          # Взаємодія з Google Sheets
+   cv_processor.py           # Обробка зображень, МЛ моделі (детекція, OCR)
+   gate_controller.py        # Керування реле та логікою воріт
+   vehicle_event_handler.py  # Обробка сценаріїв в'їзду/виїзду
+logs/
+   gate_system.log           # Файл логів роботи системи
+models/
+   ssd_mobilenetv1.onnx      # Модель детекції автомобілів
+   license.onnx              # Модель детекції номерних знаків
+   ocr.pt                    # Модель розпізнавання символів (формат PyTorch)
+tools/
+   roi_create.py             # Скрипт для ручного створення ROI
+utils/
+   logger_config.py          # Централізоване налаштування логування
+   image_utils.py            # Допоміжні функції для роботи із зображеннями
+captured_images/              # Збережені зображення (для відладки)
+   entry/
+   exit/
+   cv_debug/                 # Проміжні результати роботи CVProcessor
+README.md                     # Цей файл
+requirements.txt              # Список Python-залежностей
+    
 ## Апаратні Вимоги
 
 * Raspberry Pi 5 (рекомендовано 64-bit OS, наприклад, Debian Bookworm)
