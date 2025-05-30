@@ -5,7 +5,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # --- Налаштування шляхів для імпорту ---
 
@@ -15,7 +15,7 @@ try:
     from core.sensors_manager import SensorManager
     from core.sheet_handler import SheetHandler
     from core.gate_controller import GateController
-    from core.cv_processor import CVProcessor
+    from core.cv_processor import CVProcessor, ULTRALYTICS_AVAILABLE
     from core.vehicle_event_handler import VehicleEventHandler
 except ImportError as e:
     print(f"Критична помилка імпорту модулів: {e}")
@@ -135,7 +135,7 @@ def main_application():
             return
 
         logger.info("Ініціалізація SheetHandler...")
-        sheet_hndl = SheetHandler(credentials_file=SHEETS_CREDENTIALS_PATH)
+        sheet_hndl = SheetHandler(credentials_file_path=SHEETS_CREDENTIALS_PATH)
         if not hasattr(sheet_hndl, '_client') or sheet_hndl._client is None:
             logger.critical(
                 "SheetHandler не вдалося ініціалізувати клієнта Google Sheets. Перевірте credentials.json та URL. Завершення.")

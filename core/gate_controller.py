@@ -142,7 +142,7 @@ class GateController:
                 self._logger.error(f"Помилка під час деактивації реле '{action_name}' у блоці finally: {e_off}",
                                    exc_info=True)
 
-    def open_gate(self) -> bool:.
+    def open_gate(self) -> bool:
         if not self.relays_initialized:
             self._logger.error("Неможливо відкрити ворота: реле не ініціалізовано.")
             return False
