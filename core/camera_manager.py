@@ -5,6 +5,7 @@ from picamera2 import Picamera2, Preview
 from libcamera import Transform
 import os
 import numpy as np
+from typing import Optional, Dict, Any
 
 # Налаштування логування для модуля camera_manager
 logger = logging.getLogger(__name__)
