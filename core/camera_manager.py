@@ -58,7 +58,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ENTRY_CAM_MODEL_SUBSTRING = 'imx708'
+DEFAULT_ENTRY_CAM_MODEL_SUBSTRING = 'imx219'
 DEFAULT_EXIT_CAM_MODEL_SUBSTRING = 'imx219'
 DEFAULT_IMAGE_SAVE_PATH = "captured_images"
 
