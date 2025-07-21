@@ -6,7 +6,7 @@ import os
 import cv2
 import numpy as np
 import onnxruntime
-from typing import Optional, List, Tuple, Dict # <--- ДОДАНО ЦЕЙ ІМПОРТ
+from typing import Optional, List, Tuple, Dict
 
 try:
     from ultralytics import YOLO
@@ -15,15 +15,11 @@ except ImportError:
     ULTRALYTICS_AVAILABLE = False
     YOLO = None
 
-# Імпорт з image_utils
 from utils.image_utils import save_image, crop_image, draw_bounding_box
 
 logger = logging.getLogger(__name__)
 
-# Список символів, які може розпізнати модель OCR
 CHAR_LIST = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'E', 'H', 'I', 'K', 'M', 'O', 'P', 'T', 'X']
-
-# ID класів COCO для транспортних засобів
 TARGET_VEHICLE_CLASS_IDS = [2, 3, 5, 7] # car, motorcycle, bus, truck
 
 class CVProcessor:
@@ -134,10 +130,15 @@ class CVProcessor:
     def detect_license_plate(self, vehicle_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
         if not self.plate_session: return []
         
-        input_tensor = self._preprocess_for_yolo_onnx(vehicle_image)
+        # --- ОСНОВНА ЗМІНА ТУТ ---
+        # Вказуємо правильний розмір, який очікує модель номерних знаків
+        input_tensor = self._preprocess_for_yolo_onnx(vehicle_image, target_size=(448, 448))
+        # -------------------------
+
         outputs = self.plate_session.run(None, {self.plate_input_name: input_tensor})
         
         detections = []
+        # Обробка виходу YOLO моделі (може потребувати адаптації під вашу конкретну модель)
         for detection in outputs[0][0]:
             confidence = detection[4]
             if confidence > self.plate_confidence_thresh:
