@@ -20,7 +20,7 @@ from utils.image_utils import save_image, crop_image, draw_bounding_box
 logger = logging.getLogger(__name__)
 
 CHAR_LIST = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'E', 'H', 'I', 'K', 'M', 'O', 'P', 'T', 'X']
-TARGET_VEHICLE_CLASS_IDS = [2, 3, 5, 7] # car, motorcycle, bus, truck
+TARGET_VEHICLE_CLASS_IDS = [2, 3, 5, 7]  # car, motorcycle, bus, truck
 
 class CVProcessor:
     def __init__(self,
@@ -39,7 +39,7 @@ class CVProcessor:
 
         self.vehicle_session = self._load_onnx_model(mobilenet_ssd_path)
         self.plate_session = self._load_onnx_model(license_model_path)
-        
+
         if self.vehicle_session:
             self.vehicle_input_name = self.vehicle_session.get_inputs()[0].name
         if self.plate_session:
@@ -97,8 +97,8 @@ class CVProcessor:
     def _preprocess_for_mobilenet(self, image_bgr: np.ndarray) -> np.ndarray:
         resized_image = cv2.resize(image_bgr, (300, 300))
         return np.expand_dims(resized_image, axis=0)
-        
-    def _preprocess_for_yolo_onnx(self, image_bgr: np.ndarray, target_size=(640, 640)) -> np.ndarray:
+
+    def _preprocess_for_yolo_onnx(self, image_bgr: np.ndarray, target_size=(448, 448)) -> np.ndarray:
         img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         resized_image = cv2.resize(img_rgb, target_size)
         img_normalized = resized_image.astype(np.float32) / 255.0
@@ -110,12 +110,12 @@ class CVProcessor:
 
         img_for_detection = self._apply_roi(image_bgr, camera_type)
         input_tensor = self._preprocess_for_mobilenet(img_for_detection)
-        
+
         outputs = self.vehicle_session.run(None, {self.vehicle_input_name: input_tensor})
-        
+
         detections = []
         boxes, classes, scores, num_detections = outputs[0], outputs[1], outputs[2], outputs[3]
-        
+
         count = int(num_detections[0])
         for i in range(count):
             class_id = int(classes[0][i])
@@ -123,22 +123,17 @@ class CVProcessor:
             if score > self.vehicle_confidence_thresh and class_id in TARGET_VEHICLE_CLASS_IDS:
                 box = boxes[0][i]
                 h, w = img_for_detection.shape[:2]
-                y_min, x_min, y_max, x_max = int(box[0]*h), int(box[1]*w), int(box[2]*h), int(box[3]*w)
+                y_min, x_min, y_max, x_max = int(box[0] * h), int(box[1] * w), int(box[2] * h), int(box[3] * w)
                 detections.append((x_min, y_min, x_max, y_max))
         return detections
 
     def detect_license_plate(self, vehicle_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
         if not self.plate_session: return []
-        
-        # --- ОСНОВНА ЗМІНА ТУТ ---
-        # Вказуємо правильний розмір, який очікує модель номерних знаків
-        input_tensor = self._preprocess_for_yolo_onnx(vehicle_image, target_size=(448, 448))
-        # -------------------------
 
+        input_tensor = self._preprocess_for_yolo_onnx(vehicle_image, target_size=(448, 448))
         outputs = self.plate_session.run(None, {self.plate_input_name: input_tensor})
-        
+
         detections = []
-        # Обробка виходу YOLO моделі (може потребувати адаптації під вашу конкретну модель)
         for detection in outputs[0][0]:
             confidence = detection[4]
             if confidence > self.plate_confidence_thresh:
@@ -152,35 +147,38 @@ class CVProcessor:
 
     def recognize_plate_characters(self, plate_image: np.ndarray) -> Optional[str]:
         if not self.ocr_model: return None
-        
-        gray_plate_image = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
-        results = self.ocr_model.predict(source=gray_plate_image, conf=self.ocr_confidence_thresh, verbose=False)
-        
+
+        # --- ВИПРАВЛЕННЯ ТУТ ---
+        # Передаємо оригінальне 3-канальне зображення (BGR) напряму в модель
+        results = self.ocr_model.predict(source=plate_image, conf=self.ocr_confidence_thresh, verbose=False)
+        # -------------------------
+
         if not results or not results[0].boxes: return None
-            
+
         boxes = results[0].boxes.data.cpu().numpy()
         sorted_boxes = sorted(boxes, key=lambda b: b[0])
-        
+
         plate_text = ""
         for box in sorted_boxes:
             class_id = int(box[5])
             if 0 <= class_id < len(CHAR_LIST):
                 plate_text += CHAR_LIST[class_id]
-        
+
         return plate_text if plate_text else None
 
-    def get_plate_number_from_image(self, image_bgr: np.ndarray, cam_type: str, save_intermediate_steps: bool = False, save_path_prefix: str = "debug_cv") -> Optional[str]:
+    def get_plate_number_from_image(self, image_bgr: np.ndarray, cam_type: str, save_intermediate_steps: bool = False,
+                                    save_path_prefix: str = "debug_cv") -> Optional[str]:
         timestamp = time.strftime('%Y%m%d_%H%M%S')
 
         vehicle_boxes = self.detect_vehicle_in_frame(image_bgr, cam_type)
         if not vehicle_boxes:
             self._logger.info(f"[{cam_type.upper()}] Автомобіль не виявлено.")
             return None
-        
-        vehicle_box = max(vehicle_boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
+
+        vehicle_box = max(vehicle_boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
         vehicle_image = crop_image(image_bgr, vehicle_box)
         if vehicle_image is None: return None
-        
+
         if save_intermediate_steps:
             save_image(vehicle_image, save_path_prefix, f"{timestamp}_1_vehicle_crop.jpg")
 
@@ -188,7 +186,7 @@ class CVProcessor:
         if not plate_boxes:
             self._logger.info(f"[{cam_type.upper()}] Номерний знак не виявлено на автомобілі.")
             return None
-        
+
         plate_box = plate_boxes[0]
         plate_image = crop_image(vehicle_image, plate_box)
         if plate_image is None: return None
@@ -201,10 +199,10 @@ class CVProcessor:
             self._logger.info(f"[{cam_type.upper()}] Розпізнано номер: {plate_text}")
             if save_intermediate_steps:
                 final_img = image_bgr.copy()
-                draw_bounding_box(final_img, vehicle_box, "Vehicle", color=(0,255,0))
-                plate_abs_box = (vehicle_box[0]+plate_box[0], vehicle_box[1]+plate_box[1], 
-                                 vehicle_box[0]+plate_box[2], vehicle_box[1]+plate_box[3])
-                draw_bounding_box(final_img, plate_abs_box, plate_text, color=(255,0,0))
+                draw_bounding_box(final_img, vehicle_box, "Vehicle", color=(0, 255, 0))
+                plate_abs_box = (vehicle_box[0] + plate_box[0], vehicle_box[1] + plate_box[1],
+                                 vehicle_box[0] + plate_box[2], vehicle_box[1] + plate_box[3])
+                draw_bounding_box(final_img, plate_abs_box, plate_text, color=(255, 0, 0))
                 save_image(final_img, save_path_prefix, f"{timestamp}_3_final_result.jpg")
         else:
             self._logger.info(f"[{cam_type.upper()}] Не вдалося розпізнати символи на номерному знаку.")
