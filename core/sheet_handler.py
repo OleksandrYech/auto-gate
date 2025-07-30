@@ -124,6 +124,9 @@ class SheetHandler:
         if not worksheet: return
         try:
             current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            row_to_append = ["", "", "", plate_number, current_datetime]
+            worksheet.append_row(row_to_append, value_input_option='USER_ENTERED')
+            self._logger.info(f"Неавторизовану спробу '{plate_number}' залоговано в кінець аркуша.")
 
             # --- ВИПРАВЛЕНА ЛОГІКА ТУТ ---
             # 1. Отримуємо всі значення з колонки D, щоб знайти першу порожню клітинку
@@ -147,7 +150,9 @@ class SheetHandler:
         if not worksheet: return
         try:
             current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+            row_to_append = ["", "", "", "", "", "", plate_number, current_datetime]
+            worksheet.append_row(row_to_append, value_input_option='USER_ENTERED')
+            self._logger.info(f"Виїзд '{plate_number}' залоговано в кінець аркуша.")
             # Аналогічна логіка для колонки G
             col_values = worksheet.col_values(EXIT_PLATE_COL_G_NUM)
             next_row = max(len(col_values) + 1, ENTRY_DATA_START_ROW)

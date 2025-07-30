@@ -117,12 +117,12 @@ class VehicleEventHandler:
                 self._process_vehicle_cycle(cam_type, was_interrupted)
 
     def _polling_loop(self, camera: Optional[CameraController], cam_type: str):
-        """Цикл очікування для однієї камери."""
-        while not self.shutdown_event.is_set():
+    """Цикл очікування для однієї камери."""
+    while not self.shutdown_event.is_set():
+        try: # <-- Додай try тут
             if not self.system_busy.locked() and camera and camera.is_initialized_successfully:
                 frame = camera.capture_array()
                 if frame is not None:
-                    # У звичайному режимі просто шукаємо авто, щоб не навантажувати систему
                     detections = self.cv_processor.detect_vehicle_in_frame(frame, camera_type=cam_type)
                     if detections:
                         logger.info(f"[{cam_type.upper()}] Виявлено автомобіль. Розпізнавання номера...")
@@ -131,7 +131,15 @@ class VehicleEventHandler:
                         if plate:
                             self.handle_request(cam_type, plate)
 
-            time.sleep(self.config.get('poll_interval_idle_s', 1.0))
+        except Exception as e: # <-- Додай цей блок
+            logger.error(
+                f"Критична помилка в потоці моніторингу камери '{cam_type}'. Потік може бути недієздатним.",
+                exc_info=True
+            )
+            # Пауза перед наступною спробою, щоб уникнути спаму логами при постійній помилці
+            time.sleep(15)
+
+        time.sleep(self.config.get('poll_interval_idle_s', 1.0))
 
     def start(self, shutdown_event: threading.Event):
         if self.is_running: return
