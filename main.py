@@ -43,6 +43,9 @@ OCR_MODEL_PATH = os.path.join(MODELS_DIR, "ocr.pt")
 CAMERA_ENTRY_CONFIG: Dict[str, Any] = {"name": "EntryCamera", "resolution": (1280, 720)}
 CAMERA_EXIT_CONFIG: Dict[str, Any] = {"name": "ExitCamera", "resolution": (1280, 720)}
 
+# --- Конфігурація Sheets --
+SHEETS_URL = "https://docs.google.com/spreadsheets/d/1gz5snNdG06sPL0_w2zyWtca3BiAQ7ru8I93LqPVjrC4/edit?gid=0#gid=0"
+
 
 def main_application():
     """Головна функція запуску та керування системою."""
@@ -67,7 +70,8 @@ def main_application():
 
         # 2. Ініціалізація Google Sheets
         logger.info("Ініціалізація SheetHandler...")
-        sheet_hndl = SheetHandler(credentials_file_path=SHEETS_CREDENTIALS_PATH)
+        sheet_hndl = SheetHandler(credentials_file_path=SHEETS_CREDENTIALS_PATH,
+        spreadsheet_url=SHEETS_URL)
         if not sheet_hndl._client:
             logger.critical("SheetHandler не зміг підключитися. Перевірте файл credentials.json.")
             return
