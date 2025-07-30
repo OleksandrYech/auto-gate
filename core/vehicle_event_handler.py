@@ -3,6 +3,7 @@ import logging
 import time
 import threading
 from typing import Optional, Dict, Any, Tuple
+import cv2
 
 from .camera_manager import CameraController
 from .sensor_manager import SensorManager
@@ -121,7 +122,8 @@ class VehicleEventHandler:
     while not self.shutdown_event.is_set():
         try: # <-- Додай try тут
             if not self.system_busy.locked() and camera and camera.is_initialized_successfully:
-                frame = camera.capture_array()
+                # frame = camera.capture_array()
+                frame = cv2.imread("test_car.jpg")
                 if frame is not None:
                     detections = self.cv_processor.detect_vehicle_in_frame(frame, camera_type=cam_type)
                     if detections:
