@@ -8,32 +8,39 @@ from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
+# Перевіряємо, чи запущено проєкт у режимі симуляції
+SIMULATION_MODE = os.environ.get('SIMULATION_MODE') == '1'
+# Список авторизованих номерів для режиму симуляції
+SIMULATION_AUTHORIZED_PLATES = ['ВС2441OM', 'BH5678CE']
+
 # --- Константи, що визначають структуру вашої Google Таблиці ---
 DEFAULT_SCOPES: List[str] = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
 DEFAULT_CREDENTIALS_FILE: str = 'credentials.json'
-DEFAULT_VEHICLES_SHEET_NAME: str = 'Vehicles' # Назва вашого аркуша
+DEFAULT_VEHICLES_SHEET_NAME: str = 'Vehicles'
 
-# Стовпці для авторизованих номерів (в'їзд)
-ENTRY_PLATE_COL_A_NUM: int = 1      # Колонка A: Номер для перевірки
-ENTRY_TIMESTAMP_COL_B_NUM: int = 2  # Колонка B: Час останнього в'їзду
-ENTRY_DATA_START_ROW: int = 3       # Починати пошук з 3-го рядка
-
-# Стовпці для неавторизованих спроб
-UNAUTHORIZED_PLATE_COL_D_NUM: int = 4  # Колонка D: Запис неавторизованого номера
-UNAUTHORIZED_TIMESTAMP_COL_E_NUM: int = 5  # Колонка E: Час спроби
-
-# Стовпці для логування виїзду
-EXIT_PLATE_COL_G_NUM: int = 7       # Колонка G: Номер авто, що виїжджає
-EXIT_TIMESTAMP_COL_H_NUM: int = 8   # Колонка H: Час виїзду
+ENTRY_PLATE_COL_A_NUM: int = 1
+ENTRY_TIMESTAMP_COL_B_NUM: int = 2
+ENTRY_DATA_START_ROW: int = 3
+UNAUTHORIZED_PLATE_COL_D_NUM: int = 4
+UNAUTHORIZED_TIMESTAMP_COL_E_NUM: int = 5
+EXIT_PLATE_COL_G_NUM: int = 7
+EXIT_TIMESTAMP_COL_H_NUM: int = 8
 
 
 class SheetHandler:
-    def __init__(self, credentials_file_path: str, spreadsheet_url: str):
+    def __init__(self, credentials_file_path: str, spreadsheet_url: str = ""):
         self._logger = logging.getLogger(f"{__name__}.SheetHandler")
-        self.spreadsheet_url = spreadsheet_url
-        self.credentials_file = self._resolve_credentials_path(credentials_file_path)
-        self._client: Optional[gspread.Client] = None
-        self._active_worksheet: Optional[gspread.Worksheet] = None
+
+        if SIMULATION_MODE:
+            self._logger.warning("SheetHandler працює в РЕЖИМІ СИМУЛЯЦІЇ. Жодних звернень до Google API не буде.")
+            self._client = None
+            self._active_worksheet = None
+        else:
+            self.spreadsheet_url = spreadsheet_url
+            self.credentials_file = self._resolve_credentials_path(credentials_file_path)
+            self._client: Optional[gspread.Client] = None
+            self._active_worksheet: Optional[gspread.Worksheet] = None
+            self._connect_and_authorize()
 
         self.CYRILLIC_TO_LATIN_MAP = {
             'А': 'A', 'В': 'B', 'Е': 'E', 'І': 'I', 'К': 'K',
@@ -41,23 +48,16 @@ class SheetHandler:
             'Т': 'T', 'Х': 'X', 'У': 'Y'
         }
 
-        self._connect_and_authorize()
-
+    # ... (методи _resolve_credentials_path, _connect_and_authorize, _get_worksheet, _transliterate_to_latin залишаються без змін) ...
     def _resolve_credentials_path(self, creds_path: str) -> str:
-        """Визначає абсолютний шлях до файлу облікових даних."""
-        if os.path.isabs(creds_path):
-            return creds_path
-
+        if os.path.isabs(creds_path): return creds_path
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         config_path = os.path.join(project_root, "config", os.path.basename(creds_path))
-        if os.path.exists(config_path):
-            return config_path
-
-        self._logger.warning(f"Файл облікових даних '{creds_path}' не знайдено. Буде використано як є.")
+        if os.path.exists(config_path): return config_path
+        self._logger.warning(f"Файл облікових даних '{creds_path}' не знайдено.")
         return creds_path
 
     def _connect_and_authorize(self):
-        """Підключається та авторизується з Google Sheets API."""
         if not os.path.exists(self.credentials_file):
             self._logger.error(f"Файл облікових даних '{self.credentials_file}' не знайдено.")
             return
@@ -69,7 +69,6 @@ class SheetHandler:
             self._logger.error(f"Не вдалося авторизуватися з Google Sheets API: {e}", exc_info=True)
 
     def _get_worksheet(self) -> Optional[gspread.Worksheet]:
-        """Отримує робочий аркуш з таблиці."""
         if not self._client: return None
         if self._active_worksheet: return self._active_worksheet
         try:
@@ -81,37 +80,41 @@ class SheetHandler:
             return None
 
     def _transliterate_to_latin(self, text: str) -> str:
-        """Перетворює схожі кириличні символи в номері на латинські."""
         if not text: return ""
         text_upper = text.upper()
         return "".join([self.CYRILLIC_TO_LATIN_MAP.get(char, char) for char in text_upper])
 
+
     def find_vehicle_and_update_entry_time(self, plate_number: str) -> bool:
         """
-        Транслітерує номер, шукає його у списку з колонки A.
-        Якщо знайдено, оновлює час у колонці B і повертає True.
+        У режимі симуляції перевіряє по фіксованому списку.
+        В іншому випадку - шукає номер у колонці A та оновлює час у колонці B.
         """
+        if SIMULATION_MODE:
+            recognized_plate_latin = self._transliterate_to_latin(plate_number)
+            if recognized_plate_latin in SIMULATION_AUTHORIZED_PLATES:
+                self._logger.info(f"[СИМУЛЯЦІЯ] Авто '{plate_number}' знайдено у списку авторизованих.")
+                return True
+            else:
+                self._logger.info(f"[СИМУЛЯЦІЯ] Номер '{plate_number}' не знайдено у списку авторизованих.")
+                return False
+
+        # --- Логіка для реальної роботи ---
         worksheet = self._get_worksheet()
         if not worksheet: return False
-
         try:
             recognized_plate_latin = self._transliterate_to_latin(plate_number)
             self._logger.debug(f"Пошук номера '{plate_number}' (трансліт: '{recognized_plate_latin}')")
-
             authorized_plates_raw = worksheet.col_values(ENTRY_PLATE_COL_A_NUM)
-
             for i, plate_from_sheet in enumerate(authorized_plates_raw):
                 row_number = i + 1
                 if row_number < ENTRY_DATA_START_ROW: continue
-
                 plate_from_sheet_latin = self._transliterate_to_latin(plate_from_sheet)
-
                 if recognized_plate_latin == plate_from_sheet_latin:
                     current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     worksheet.update_cell(row_number, ENTRY_TIMESTAMP_COL_B_NUM, current_datetime)
                     self._logger.info(f"Авто '{plate_number}' знайдено у рядку {row_number}. Час в'їзду оновлено.")
                     return True
-
             self._logger.info(f"Номер '{plate_number}' не знайдено у списку авторизованих.")
             return False
         except Exception as e:
@@ -119,47 +122,38 @@ class SheetHandler:
             return False
 
     def add_unauthorized_attempt(self, plate_number: str):
-        """Додає розпізнаний, але неавторизований номер у колонку D."""
+        if SIMULATION_MODE:
+            self._logger.info(f"[СИМУЛЯЦІЯ] Записано неавторизовану спробу для номера '{plate_number}'.")
+            return
+
         worksheet = self._get_worksheet()
+        # ... (решта коду без змін) ...
         if not worksheet: return
         try:
             current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            row_to_append = ["", "", "", plate_number, current_datetime]
-            worksheet.append_row(row_to_append, value_input_option='USER_ENTERED')
-            self._logger.info(f"Неавторизовану спробу '{plate_number}' залоговано в кінець аркуша.")
-
-            # --- ВИПРАВЛЕНА ЛОГІКА ТУТ ---
-            # 1. Отримуємо всі значення з колонки D, щоб знайти першу порожню клітинку
             col_values = worksheet.col_values(UNAUTHORIZED_PLATE_COL_D_NUM)
-            # 2. Номер наступного рядка - це поточна довжина списку + 1
-            #    Використовуємо max, щоб гарантувати, що запис буде не вище ENTRY_DATA_START_ROW
             next_row = max(len(col_values) + 1, ENTRY_DATA_START_ROW)
-
-            # 3. Записуємо дані у конкретні клітинки
             worksheet.update_cell(next_row, UNAUTHORIZED_PLATE_COL_D_NUM, plate_number)
             worksheet.update_cell(next_row, UNAUTHORIZED_TIMESTAMP_COL_E_NUM, current_datetime)
             self._logger.info(f"Неавторизовану спробу '{plate_number}' залоговано у рядок {next_row}.")
-            # ---------------------------
-
         except Exception as e:
             self._logger.error(f"Помилка логування неавторизованої спроби '{plate_number}': {e}", exc_info=True)
 
+
     def log_vehicle_exit(self, plate_number: str):
-        """Логує виїзд автомобіля."""
+        if SIMULATION_MODE:
+            self._logger.info(f"[СИМУЛЯЦІЯ] Записано виїзд для номера '{plate_number}'.")
+            return
+
         worksheet = self._get_worksheet()
+        # ... (решта коду без змін) ...
         if not worksheet: return
         try:
             current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            row_to_append = ["", "", "", "", "", "", plate_number, current_datetime]
-            worksheet.append_row(row_to_append, value_input_option='USER_ENTERED')
-            self._logger.info(f"Виїзд '{plate_number}' залоговано в кінець аркуша.")
-            # Аналогічна логіка для колонки G
             col_values = worksheet.col_values(EXIT_PLATE_COL_G_NUM)
             next_row = max(len(col_values) + 1, ENTRY_DATA_START_ROW)
-
             worksheet.update_cell(next_row, EXIT_PLATE_COL_G_NUM, plate_number)
             worksheet.update_cell(next_row, EXIT_TIMESTAMP_COL_H_NUM, current_datetime)
-
             self._logger.info(f"Виїзд '{plate_number}' залоговано у рядок {next_row}.")
         except Exception as e:
             self._logger.error(f"Помилка логування виїзду '{plate_number}': {e}", exc_info=True)

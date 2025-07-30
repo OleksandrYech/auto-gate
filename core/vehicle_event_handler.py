@@ -3,10 +3,10 @@ import logging
 import time
 import threading
 from typing import Optional, Dict, Any, Tuple
-import cv2
+import cv2  # Імпорт для читання зображень з файлу на WSL
 
 from .camera_manager import CameraController
-from .sensor_manager import SensorManager
+from .sensors_manager import SensorManager
 from .sheet_handler import SheetHandler
 from .cv_processor import CVProcessor
 from .gate_controller import GateController
@@ -45,6 +45,9 @@ class VehicleEventHandler:
 
         for cam, cam_type in cameras_to_check:
             if cam and cam.is_initialized_successfully:
+                # Для тестування на WSL, цей блок також можна змінити на читання з файлу,
+                # але для простоти припускаємо, що переривання не тестується активно.
+                # Якщо потрібно, додайте тут `frame = cv2.imread(...)`
                 frame = cam.capture_array()
                 if frame is not None:
                     plate_text = self.cv_processor.get_plate_number_from_image(frame, camera_type=cam_type)
@@ -118,30 +121,36 @@ class VehicleEventHandler:
                 self._process_vehicle_cycle(cam_type, was_interrupted)
 
     def _polling_loop(self, camera: Optional[CameraController], cam_type: str):
-    """Цикл очікування для однієї камери."""
-    while not self.shutdown_event.is_set():
-        try: # <-- Додай try тут
-            if not self.system_busy.locked() and camera and camera.is_initialized_successfully:
-                # frame = camera.capture_array()
-                frame = cv2.imread("test_car.jpg")
-                if frame is not None:
-                    detections = self.cv_processor.detect_vehicle_in_frame(frame, camera_type=cam_type)
-                    if detections:
-                        logger.info(f"[{cam_type.upper()}] Виявлено автомобіль. Розпізнавання номера...")
-                        plate = self.cv_processor.get_plate_number_from_image(frame, cam_type=cam_type,
-                                                                              save_intermediate_steps=True)
-                        if plate:
-                            self.handle_request(cam_type, plate)
+        """Цикл очікування для однієї камери."""
+        while not self.shutdown_event.is_set():
+            try:
+                if not self.system_busy.locked() and camera and camera.is_initialized_successfully:
 
-        except Exception as e: # <-- Додай цей блок
-            logger.error(
-                f"Критична помилка в потоці моніторингу камери '{cam_type}'. Потік може бути недієздатним.",
-                exc_info=True
-            )
-            # Пауза перед наступною спробою, щоб уникнути спаму логами при постійній помилці
-            time.sleep(15)
+                    # --- МОДИФІКАЦІЯ ДЛЯ ТЕСТУВАННЯ НА WSL ---
+                    # Замість захоплення з камери, читаємо зображення з файлу.
+                    # Переконайтесь, що файл 'test_car.jpg' лежить у кореневій папці проєкту.
+                    frame = cv2.imread("test_image.jpg")
+                    # ----------------------------------------
 
-        time.sleep(self.config.get('poll_interval_idle_s', 1.0))
+                    if frame is not None:
+                        # У звичайному режимі просто шукаємо авто, щоб не навантажувати систему
+                        detections = self.cv_processor.detect_vehicle_in_frame(frame, camera_type=cam_type)
+                        if detections:
+                            logger.info(f"[{cam_type.upper()}] Виявлено автомобіль. Розпізнавання номера...")
+                            plate = self.cv_processor.get_plate_number_from_image(frame, cam_type=cam_type,
+                                                                                  save_intermediate_steps=True)
+                            if plate:
+                                self.handle_request(cam_type, plate)
+
+            except Exception as e:
+                logger.error(
+                    f"Критична помилка в потоці моніторингу камери '{cam_type}'.",
+                    exc_info=True
+                )
+                # Пауза, щоб уникнути спаму логами при постійній помилці
+                time.sleep(15)
+
+            time.sleep(self.config.get('poll_interval_idle_s', 1.0))
 
     def start(self, shutdown_event: threading.Event):
         if self.is_running: return
