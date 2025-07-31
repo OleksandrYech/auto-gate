@@ -7,5 +7,6 @@ oauth2client
 RPi.GPIO
 gpiozero
 picamera2
+python-telegram-bot --pre
 # sudo apt update
 # sudo apt install python3-pigpio
