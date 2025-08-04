@@ -96,7 +96,6 @@ def main_application():
         cv_proc = CVProcessor(
             mobilenet_ssd_path=MOBILENET_SSD_PATH,
             license_model_path=LICENSE_PLATE_MODEL_PATH,
-            ocr_model_path=OCR_MODEL_PATH,
             roi_config_path=ROI_CONFIG_PATH
         )
 
