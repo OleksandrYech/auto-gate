@@ -1,157 +1,107 @@
-# core/vehicle_event_handler.py
+# core/sensors_manager.py
 import logging
-import time
-import threading
-from typing import Optional, Dict, Any, Tuple
-from datetime import datetime
+from typing import Optional
 
-# Припускаємо, що ці модулі існують у проєкті
-from .camera_manager import CameraController
-from .sensors_manager import SensorManager
-from .sheet_handler import SheetHandler
-from .cv_processor import CVProcessor
-from .gate_controller import GateController
-
-# Опціональний імпорт для сповіщень
 try:
-    from bot.telegram_notifier import TelegramNotifier
+    from gpiozero import DigitalInputDevice
+    from gpiozero.pins.pigpio import PiGPIOFactory
+
+    GPIOZERO_AVAILABLE = True
+
+    try:
+        factory = PiGPIOFactory()
+        logging.getLogger(__name__).info("Використовується PiGPIOFactory для керування пінами.")
+    except Exception:
+        factory = None
+        logging.getLogger(__name__).warning(
+            "Не вдалося ініціалізувати PiGPIOFactory. Використовується фабрика за замовчуванням.")
+
 except ImportError:
-    TelegramNotifier = None
+    GPIOZERO_AVAILABLE = False
+    factory = None
 
-logger = logging.getLogger(__name__)
+    class DigitalInputDevice:
+        def __init__(self, pin, pull_up=None, pin_factory=None):
+            self.pin = pin
+            # Імітуємо, що ворота спочатку закриті (геркон розімкнений)
+            self.is_active = False
+            logging.getLogger(__name__).info(f"Мок DigitalInputDevice створено для піна {pin}")
+
+        def close(self): pass
+        def wait_for_active(self, timeout=None): self.is_active = True; return True
+        def wait_for_inactive(self, timeout=None): self.is_active = False; return True
 
 
-class VehicleEventHandler:
-    """
-    Головний клас, що керує логікою обробки подій, пов'язаних з автомобілями.
-    """
-    def __init__(self,
-                 camera_entry: Optional[CameraController],
-                 camera_exit: Optional[CameraController],
-                 sensor_manager: SensorManager,
-                 sheet_handler: SheetHandler,
-                 cv_processor: CVProcessor,
-                 gate_controller: GateController,
-                 config: Dict[str, Any],
-                 notifier: Optional[TelegramNotifier] = None):
+class ReedSwitch:
+    """Клас для роботи з герконовим датчиком."""
 
-        self.camera_entry = camera_entry
-        self.camera_exit = camera_exit
-        self.sensor_manager = sensor_manager
-        self.sheet_handler = sheet_handler
-        self.cv_processor = cv_processor
-        self.gate_controller = gate_controller
-        self.notifier = notifier
-        self.config = config
+    def __init__(self, pin_number: int, name: str = "ReedSwitch"):
+        self.name = name
+        self.pin_number = pin_number
+        self._logger = logging.getLogger(f"{__name__}.{self.name}")
+        self._device: Optional[DigitalInputDevice] = None
 
-        self.is_running = False
-        self.shutdown_event = threading.Event()
-        self.system_busy = threading.Lock()
-
-        self.entry_thread: Optional[threading.Thread] = None
-        self.exit_thread: Optional[threading.Thread] = None
-
-    def _process_vehicle_cycle(self, cam_type: str):
-        """Спрощений цикл керування воротами (відкриття, очікування, закриття)."""
-        logger.info(f"[{cam_type.upper()}] Початок циклу. Команда на відкриття воріт.")
-        self.gate_controller.open_gate()
-
-        if not self.sensor_manager.reed_switch.wait_for_open(timeout=self.config['reed_open_timeout_s']):
-            logger.error(f"[{cam_type.upper()}] Ворота не відкрилися (немає сигналу від геркона). Цикл перервано.")
+        if not GPIOZERO_AVAILABLE:
+            self._logger.warning("gpiozero недоступна. Геркон працюватиме в мок-режимі.")
+            self._device = DigitalInputDevice(pin_number, pull_up=True)
             return
 
-        logger.info(f"[{cam_type.upper()}] Ворота відкрито. Очікування проїзду.")
+        try:
+            # pull_up=True: is_active стає True, коли геркон замикається на землю (ворота ВІДКРИТІ).
+            self._device = DigitalInputDevice(pin_number, pull_up=True, pin_factory=factory)
+            self._logger.info(f"Геркон '{self.name}' ініціалізовано на GPIO{self.pin_number}.")
+        except Exception as e:
+            self._logger.error(f"Не вдалося ініціалізувати геркон '{self.name}': {e}", exc_info=True)
 
-        # Використовуємо єдиний тайм-аут для проїзду
-        passage_timeout = self.config['passage_timeout_s']
-        time.sleep(passage_timeout)
-        logger.info(f"[{cam_type.upper()}] Час на проїзд ({passage_timeout}с) вичерпано. Початок закриття.")
+    @property
+    def are_gates_open(self) -> bool:
+        """Повертає True, якщо ворота повністю відкриті (контакт геркона замкнений)."""
+        if self._device is None: return False
+        return self._device.is_active
 
-        self.gate_controller.close_gate()
+    @property
+    def is_gate_closed_or_moving(self) -> bool:
+        """Повертає True, якщо ворота не у повністю відкритому положенні (геркон розімкнений)."""
+        if self._device is None: return True  # Безпечне значення за замовчуванням
+        return not self._device.is_active
 
-        # --- СПРОЩЕНА ЛОГІКА ---
-        # Замість циклу "гарячого очікування" тепер проста затримка
-        gate_travel_time = self.config['gate_travel_time_s']
-        logger.info(f"[{cam_type.upper()}] Очікування {gate_travel_time}с, поки ворота зачиняться...")
-        time.sleep(gate_travel_time)
-        # ------------------------
+    def wait_for_open(self, timeout: Optional[float] = None) -> bool:
+        """Очікує, поки ворота повністю відкриються (геркон замкнеться)."""
+        if not self._device: return False
+        try:
+            return self._device.wait_for_active(timeout)
+        except Exception:
+            return False
 
-        logger.info(f"[{cam_type.upper()}] Час ходу воріт минув. Вважаємо ворота закритими.")
-        logger.info(f"[{cam_type.upper()}] Повний цикл завершено.")
-
-    def handle_request(self, cam_type: str, plate_text: str, photo_path: Optional[str] = None):
+    def wait_for_closed(self, timeout: Optional[float] = None) -> bool:
         """
-        Обробляє один повний випадок розпізнавання: авторизація, сповіщення, керування воротами.
+        Очікує, поки ворота почнуть закриватися (геркон розімкнеться).
         """
-        if self.system_busy.locked():
-            logger.warning(f"[{cam_type.upper()}] Система зайнята. Запит для '{plate_text}' ігнорується.")
-            return
+        if not self._device: return False
+        try:
+            return self._device.wait_for_inactive(timeout)
+        except Exception:
+            return False
 
-        with self.system_busy:
-            if cam_type == 'entry':
-                is_authorized = self.sheet_handler.find_vehicle_and_update_entry_time(plate_text)
-                status = "Авторизовано" if is_authorized else "НЕ Авторизовано"
+    def cleanup(self):
+        if self._device:
+            self._device.close()
+            self._logger.info(f"Ресурси геркона '{self.name}' звільнено.")
 
-                if self.notifier and photo_path:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self.notifier.send_notification(photo_path, plate_text, timestamp, status)
 
-                if is_authorized:
-                    logger.info(f"[ENTRY] Номер '{plate_text}' авторизовано.")
-                    self._process_vehicle_cycle(cam_type)
-                else:
-                    logger.info(f"[ENTRY] Номер '{plate_text}' НЕ авторизовано.")
-                    self.sheet_handler.add_unauthorized_attempt(plate_text)
+class SensorManager:
+    """Керує всіма сенсорами системи."""
 
-            elif cam_type == 'exit':
-                logger.info(f"[EXIT] Автомобіль на виїзд. Відкриття воріт.")
-                self.sheet_handler.log_vehicle_exit(plate_text or "UNKNOWN")
-                self._process_vehicle_cycle(cam_type)
+    def __init__(self, reed_pin: int, reed_name: str = "GateReedSensor"):
+        self._logger = logging.getLogger(f"{__name__}.SensorManager")
+        self._logger.info("Ініціалізація SensorManager...")
+        self.reed_switch: Optional[ReedSwitch] = None
+        try:
+            self.reed_switch = ReedSwitch(pin_number=reed_pin, name=reed_name)
+        except Exception as e:
+            self._logger.error(f"Не вдалося ініціалізувати {reed_name}: {e}", exc_info=True)
+        self._logger.info("SensorManager ініціалізацію завершено.")
 
-    def _polling_loop(self, camera: Optional[CameraController], cam_type: str):
-        """Цикл, що постійно опитує камеру на наявність автомобіля."""
-        while not self.shutdown_event.is_set():
-            if not self.system_busy.locked() and camera and camera.is_initialized_successfully:
-                try:
-                    frame = camera.capture_array()
-                    if frame is not None:
-                        if self.cv_processor.detect_vehicle_in_frame(frame, camera_type=cam_type):
-                            logger.info(f"[{cam_type.upper()}] Виявлено рух. Запуск розпізнавання номера...")
-
-                            plate, photo_path = self.cv_processor.get_plate_number_from_image(
-                                frame, cam_type, save_intermediate_steps=True, save_path_prefix="captures"
-                            )
-
-                            if plate:
-                                self.handle_request(cam_type, plate, photo_path)
-                except Exception as e:
-                    logger.error(f"Помилка в циклі опитування камери '{cam_type}': {e}", exc_info=True)
-                    time.sleep(5)
-
-            time.sleep(self.config.get('poll_interval_idle_s', 1.0))
-
-    def start(self, shutdown_event: threading.Event):
-        """Запускає потоки моніторингу для камер в'їзду та виїзду."""
-        if self.is_running:
-            return
-        self.is_running = True
-        self.shutdown_event = shutdown_event
-
-        if self.camera_entry:
-            self.entry_thread = threading.Thread(target=self._polling_loop, args=(self.camera_entry, 'entry'))
-            self.entry_thread.start()
-
-        if self.camera_exit:
-            self.exit_thread = threading.Thread(target=self._polling_loop, args=(self.camera_exit, 'exit'))
-            self.exit_thread.start()
-
-        logger.info("Потоки обробки в'їзду та виїзду запущено.")
-
-    def stop(self):
-        """Зупиняє потоки обробки."""
-        self.is_running = False
-        if self.entry_thread:
-            self.entry_thread.join()
-        if self.exit_thread:
-            self.exit_thread.join()
-        logger.info("Потоки обробки зупинено.")
+    def cleanup(self):
+        if self.reed_switch:
+            self.reed_switch.cleanup()
