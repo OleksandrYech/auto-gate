@@ -9,7 +9,6 @@ import numpy as np
 import onnxruntime
 from typing import Optional, List, Tuple
 
-# --- НОВИЙ ІМПОРТ ---
 import easyocr
 
 from utils.image_utils import save_image, crop_image, draw_bounding_box
@@ -19,7 +18,7 @@ logger = logging.getLogger(__name__)
 TARGET_VEHICLE_CLASS_IDS = [2, 3, 5, 7]
 LICENSE_PLATE_CLASS_ID = 0
 
-def _check_bbox_roi_intersection(bbox: Tuple[int, int, int, int], roi: dict[str, int]) -> bool:
+def _check_bbox_roi_intersection(bbox: Tuple[int, int, int, int], roi: Dict[str, int]) -> bool:
     car_x1, car_y1, car_x2, car_y2 = bbox
     roi_x1, roi_y1, roi_x2, roi_y2 = roi['x1'], roi['y1'], roi['x2'], roi['y2']
     if car_x2 < roi_x1 or car_x1 > roi_x2 or car_y2 < roi_y1 or car_y1 > roi_y2:
@@ -41,12 +40,9 @@ class CVProcessor:
         self.vehicle_session = self._load_onnx_model(mobilenet_ssd_path)
         self.plate_session = self._load_onnx_model(license_model_path)
 
-        # --- ЗМІНА: Ініціалізація easyocr ---
-        self._logger.info("Ініціалізація EasyOCR... Це може зайняти час і вимагати завантаження моделей.")
-        # Вказуємо українську та англійську мови для кращого розпізнавання номерів
-        self.ocr_reader = easyocr.Reader(['uk', 'en'], gpu=False) # gpu=False для WSL/RPi
+        self._logger.info("Ініціалізація EasyOCR...")
+        self.ocr_reader = easyocr.Reader(['en'], gpu=False)
         self._logger.info("EasyOCR успішно ініціалізовано.")
-        # ------------------------------------
 
         if self.vehicle_session:
             self.vehicle_input_name = self.vehicle_session.get_inputs()[0].name
@@ -59,24 +55,63 @@ class CVProcessor:
         self.roi_config = self._load_roi_config(roi_config_path)
         self._logger.info("CVProcessor успішно ініціалізовано.")
 
-    # --- ПОВНІСТЮ ПЕРЕПИСАНИЙ МЕТОД ---
+    # --- ПОВНІСТЮ ПЕРЕПИСАНА ФУНКЦІЯ ФОРМАТУВАННЯ ТА ВАЛІДАЦІЇ ---
+    def _format_plate_number(self, raw_text: str) -> Optional[str]:
+        """
+        Очищує, виправляє та валідує номерний знак.
+        Повертає номер, тільки якщо він відповідає стандарту AA1111AA, інакше повертає None.
+        """
+        if not raw_text:
+            return None
+
+        # 1. Попередня очистка: видаляємо все, крім літер та цифр, переводимо у верхній регістр.
+        # Додаємо кириличні символи, схожі на латинські, для кращої очистки.
+        clean_text = re.sub(r'[^A-ZА-Я0-9]', '', raw_text.upper())
+
+        # 2. Перевірка довжини. Для стандарту AA1111AA довжина має бути 8.
+        if len(clean_text) != 8:
+            self._logger.debug(f"Номер '{clean_text}' відхилено через некоректну довжину ({len(clean_text)}).")
+            return None
+
+        # 3. Інтелектуальне виправлення символів на основі їх позиції
+        plate_chars = list(clean_text)
+        digit_to_letter = {'0': 'O', '1': 'I', '8': 'B'}
+        letter_to_digit = {'O': '0', 'I': '1', 'B': '8', 'A': '4'}
+
+        # Перші 2 символи мають бути літерами
+        for i in [0, 1]:
+            if plate_chars[i].isdigit(): plate_chars[i] = digit_to_letter.get(plate_chars[i], plate_chars[i])
+
+        # Наступні 4 символи мають бути цифрами
+        for i in range(2, 6):
+            if plate_chars[i].isalpha(): plate_chars[i] = letter_to_digit.get(plate_chars[i], plate_chars[i])
+
+        # Останні 2 символи мають бути літерами
+        for i in [6, 7]:
+            if plate_chars[i].isdigit(): plate_chars[i] = digit_to_letter.get(plate_chars[i], plate_chars[i])
+
+        corrected_plate = "".join(plate_chars)
+
+        # 4. Фінальна валідація за допомогою регулярного виразу
+        if re.fullmatch(r'^[A-Z]{2}\d{4}[A-Z]{2}$', corrected_plate):
+            self._logger.debug(f"Номер '{raw_text}' -> '{corrected_plate}' успішно валідовано.")
+            return corrected_plate
+        else:
+            self._logger.warning(f"Номер '{raw_text}' -> '{corrected_plate}' відхилено, оскільки він не відповідає стандарту AA1111AA.")
+            return None
+
     def recognize_plate_characters(self, plate_image: np.ndarray) -> Optional[str]:
         """Розпізнає символи на зображенні номерного знака за допомогою EasyOCR."""
         try:
-            # Запускаємо розпізнавання
             result = self.ocr_reader.readtext(plate_image, detail=0, paragraph=True)
-
             if not result:
                 return None
-
-            # Результат - це список рядків. Об'єднуємо їх і чистимо.
-            plate_text = "".join(result).replace(" ", "").upper()
-            return plate_text if plate_text else None
+            return "".join(result).replace(" ", "").upper()
         except Exception as e:
             self._logger.error(f"Помилка під час роботи EasyOCR: {e}", exc_info=True)
             return None
 
-    # ... (решта файлу залишається без змін, я привів його для повноти) ...
+    # ... (решта методів залишаються без змін) ...
     def _load_onnx_model(self, model_path: str) -> Optional[onnxruntime.InferenceSession]:
         if not os.path.exists(model_path):
             self._logger.error(f"Файл моделі ONNX не знайдено: {model_path}")
@@ -118,14 +153,6 @@ class CVProcessor:
                 x1, y1, x2, y2 = map(int, (det[0] * original_w, det[1] * original_h, det[2] * original_w, det[3] * original_h))
                 detections.append((x1, y1, x2, y2))
         return detections
-
-    def _format_plate_number(self, raw_text: str) -> str:
-        if not raw_text: return ""
-        clean_text = re.sub(r'[^A-ZА-Я0-9]', '', raw_text.upper()) # Додано кирилицю
-        if len(clean_text) < 7 or len(clean_text) > 8: return clean_text
-
-        # Спрощена логіка, оскільки easyocr точніший
-        return clean_text
 
     def detect_vehicle_in_frame(self, image_bgr: np.ndarray, camera_type: str) -> List[Tuple[int, int, int, int]]:
         if not self.vehicle_session: return []
@@ -186,9 +213,11 @@ class CVProcessor:
 
         raw_plate_text = self.recognize_plate_characters(plate_image)
 
-        if raw_plate_text:
-            formatted_plate = self._format_plate_number(raw_plate_text)
-            self._logger.info(f"[{cam_type.upper()}] Розпізнано (EasyOCR): '{raw_plate_text}', відформатовано: '{formatted_plate}'")
+        # Тепер ця функція поверне None, якщо номер не валідний
+        formatted_plate = self._format_plate_number(raw_plate_text)
+
+        if formatted_plate:
+            self._logger.info(f"[{cam_type.upper()}] Розпізнано та валідовано: '{raw_plate_text}' -> '{formatted_plate}'")
             if save_intermediate_steps:
                 final_img = image_bgr.copy()
                 draw_bounding_box(final_img, vehicle_box, "Vehicle", color=(0, 255, 0))
@@ -199,5 +228,5 @@ class CVProcessor:
                 save_image(final_img, save_path_prefix, os.path.basename(final_image_path))
             return formatted_plate, final_image_path
         else:
-            self._logger.info(f"[{cam_type.upper()}] Не вдалося розпізнати символи на номерному знаку.")
+            self._logger.info(f"[{cam_type.upper()}] Номер '{raw_plate_text}' розпізнано, але він не пройшов валідацію.")
             return None, None
