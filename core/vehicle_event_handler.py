@@ -27,7 +27,7 @@ class VehicleEventHandler:
                  sheet_handler: SheetHandler,
                  cv_processor: CVProcessor,
                  gate_controller: GateController,
-                 config: dict[str, Any],
+                 config: Dict[str, Any],
                  notifier: Optional[TelegramNotifier] = None):
 
         self.camera_entry = camera_entry
@@ -38,6 +38,12 @@ class VehicleEventHandler:
         self.gate_controller = gate_controller
         self.notifier = notifier
         self.config = config
+
+        # --- НОВА ЛОГІКА: Словник для відстеження часу останньої детекції ---
+        self.last_detection_times: Dict[str, float] = {}
+        # Час у секундах, протягом якого повторні детекції ігноруються
+        self.cooldown_period_s = config.get("sheets_antiduplicate_delay_s", 60)
+        # -----------------------------------------------------------------
 
         self.is_running = False
         self.shutdown_event = threading.Event()
@@ -56,26 +62,22 @@ class VehicleEventHandler:
             return
 
         logger.info(f"[{cam_type.upper()}] Ворота відкрито. Очікування проїзду.")
-
+        
         passage_timeout = self.config['passage_timeout_s']
         time.sleep(passage_timeout)
         logger.info(f"[{cam_type.upper()}] Час на проїзд ({passage_timeout}с) вичерпано. Початок закриття.")
 
         self.gate_controller.close_gate()
-
-        # --- ОНОВЛЕНА ЛОГІКА ЗАКРИТТЯ ---
+        
         gate_travel_time = self.config['gate_travel_time_s']
         logger.info(f"[{cam_type.upper()}] Очікування, поки ворота почнуть зачинятися (сигнал від геркона)...")
-
-        # Чекаємо, поки геркон розімкнеться, що означає, що ворота покинули кінцеву точку "відкрито"
+        
         if self.sensor_manager.reed_switch.wait_for_closed(timeout=gate_travel_time):
             logger.info(f"[{cam_type.upper()}] Геркон розімкнувся. Ворота зачиняються або вже зачинені.")
         else:
-            # Це може статися, якщо ворота застрягли у відкритому положенні
-            logger.warning(f"[{cam_type.upper()}] Не отримано сигнал про закриття від геркона за {gate_travel_time}с. Можливо, ворота заблоковані.")
-
+            logger.warning(f"[{cam_type.upper()}] Не отримано сигнал про закриття від геркона за {gate_travel_time}с.")
+        
         logger.info(f"[{cam_type.upper()}] Повний цикл завершено.")
-        # --------------------------------
 
     def handle_request(self, cam_type: str, plate_text: str, photo_path: Optional[str] = None):
         if self.system_busy.locked():
@@ -90,7 +92,7 @@ class VehicleEventHandler:
                 if self.notifier and photo_path:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self.notifier.send_notification(photo_path, plate_text, timestamp, status)
-
+                
                 if is_authorized:
                     logger.info(f"[ENTRY] Номер '{plate_text}' авторизовано.")
                     self._process_vehicle_cycle(cam_type)
@@ -104,20 +106,42 @@ class VehicleEventHandler:
                 self._process_vehicle_cycle(cam_type)
 
     def _polling_loop(self, camera: Optional[CameraController], cam_type: str):
+        """Цикл, що постійно опитує камеру та фільтрує повторні детекції."""
         while not self.shutdown_event.is_set():
-            if not self.system_busy.locked() and camera and camera.is_initialized_successfully:
+            if self.system_busy.locked():
+                time.sleep(self.config.get('poll_interval_idle_s', 1.0))
+                continue
+
+            if camera and camera.is_initialized_successfully:
                 try:
                     frame = camera.capture_array()
-                    if frame is not None:
-                        if self.cv_processor.detect_vehicle_in_frame(frame, camera_type=cam_type):
-                            logger.info(f"[{cam_type.upper()}] Виявлено рух. Запуск розпізнавання номера...")
+                    if frame is None:
+                        time.sleep(self.config.get('poll_interval_idle_s', 1.0))
+                        continue
 
-                            plate, photo_path = self.cv_processor.get_plate_number_from_image(
-                                frame, cam_type, save_intermediate_steps=True, save_path_prefix="captures"
-                            )
+                    if self.cv_processor.detect_vehicle_in_frame(frame, camera_type=cam_type):
+                        logger.debug(f"[{cam_type.upper()}] Виявлено рух. Запуск розпізнавання номера...")
+                        
+                        plate, photo_path = self.cv_processor.get_plate_number_from_image(
+                            frame, cam_type, save_intermediate_steps=True, save_path_prefix="captures"
+                        )
+                        
+                        if plate:
+                            # --- ОНОВЛЕНА ЛОГІКА: Перевірка "періоду спокою" ---
+                            current_time = time.monotonic()
+                            last_seen = self.last_detection_times.get(plate)
+                            
+                            if last_seen and (current_time - last_seen < self.cooldown_period_s):
+                                logger.info(f"Номер '{plate}' розпізнано повторно. Ігноруємо, оскільки не минуло {self.cooldown_period_s}с.")
+                                # Пропускаємо обробку, але не оновлюємо час, щоб "період спокою" не продовжувався нескінченно
+                                continue
+                            
+                            # Якщо номер бачимо вперше або "період спокою" минув - обробляємо
+                            self.last_detection_times[plate] = current_time
+                            logger.info(f"Нова детекція для номера '{plate}'. Передача в обробник.")
+                            self.handle_request(cam_type, plate, photo_path)
+                            # ----------------------------------------------------
 
-                            if plate:
-                                self.handle_request(cam_type, plate, photo_path)
                 except Exception as e:
                     logger.error(f"Помилка в циклі опитування камери '{cam_type}': {e}", exc_info=True)
                     time.sleep(5)
@@ -125,22 +149,21 @@ class VehicleEventHandler:
             time.sleep(self.config.get('poll_interval_idle_s', 1.0))
 
     def start(self, shutdown_event: threading.Event):
+        # ... (код без змін)
         if self.is_running:
             return
         self.is_running = True
         self.shutdown_event = shutdown_event
-
         if self.camera_entry:
             self.entry_thread = threading.Thread(target=self._polling_loop, args=(self.camera_entry, 'entry'))
             self.entry_thread.start()
-
         if self.camera_exit:
             self.exit_thread = threading.Thread(target=self._polling_loop, args=(self.camera_exit, 'exit'))
             self.exit_thread.start()
-
         logger.info("Потоки обробки в'їзду та виїзду запущено.")
 
     def stop(self):
+        # ... (код без змін)
         self.is_running = False
         if self.entry_thread:
             self.entry_thread.join()
