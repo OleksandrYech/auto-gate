@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 
 from .camera_manager import CameraController
-from .sensor_manager import SensorManager
+from .sensors_manager import SensorManager
 from .sheet_handler import SheetHandler
 from .cv_processor import CVProcessor
 from .gate_controller import GateController
@@ -27,7 +27,7 @@ class VehicleEventHandler:
                  sheet_handler: SheetHandler,
                  cv_processor: CVProcessor,
                  gate_controller: GateController,
-                 config: Dict[str, Any],
+                 config: dict[str, Any],
                  notifier: Optional[TelegramNotifier] = None):
 
         self.camera_entry = camera_entry
