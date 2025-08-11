@@ -9,21 +9,31 @@ import numpy as np
 import onnxruntime
 from typing import Optional, List, Tuple
 
+# EasyOCR імпортується як основний інструмент для розпізнавання
 import easyocr
 
 from utils.image_utils import save_image, crop_image, draw_bounding_box
 
 logger = logging.getLogger(__name__)
 
-TARGET_VEHICLE_CLASS_IDS = [2, 3, 5, 7]
-LICENSE_PLATE_CLASS_ID = 0
+# Константи для класів об'єктів у моделях
+TARGET_VEHICLE_CLASS_IDS = [2, 3, 5, 7]  # ID для легкових авто, мотоциклів, автобусів, вантажівок
+LICENSE_PLATE_CLASS_ID = 0 # ID для номерного знака
 
 def _check_bbox_roi_intersection(bbox: Tuple[int, int, int, int], roi: Dict[str, int]) -> bool:
+    """Перевіряє, чи перетинається рамка об'єкта (bbox) із зоною інтересу (ROI)."""
     car_x1, car_y1, car_x2, car_y2 = bbox
+    # Якщо ROI неактивний або неправильно налаштований, вважаємо, що перетин є
+    if not roi.get("enabled") or roi['x2'] <= roi['x1'] or roi['y2'] <= roi['y1']:
+        return True
+
     roi_x1, roi_y1, roi_x2, roi_y2 = roi['x1'], roi['y1'], roi['x2'], roi['y2']
+
+    # Логіка перевірки перетину
     if car_x2 < roi_x1 or car_x1 > roi_x2 or car_y2 < roi_y1 or car_y1 > roi_y2:
-        return False
-    return True
+        return False # Немає перетину
+    return True # Є перетин
+
 
 class CVProcessor:
     def __init__(self,
@@ -37,12 +47,21 @@ class CVProcessor:
         self.vehicle_confidence_thresh = vehicle_confidence_thresh
         self.plate_confidence_thresh = plate_confidence_thresh
 
+        # Завантаження моделей ONNX
         self.vehicle_session = self._load_onnx_model(mobilenet_ssd_path)
         self.plate_session = self._load_onnx_model(license_model_path)
 
+        # Ініціалізація EasyOCR
         self._logger.info("Ініціалізація EasyOCR...")
         self.ocr_reader = easyocr.Reader(['en'], gpu=False)
         self._logger.info("EasyOCR успішно ініціалізовано.")
+
+        # --- НОВИЙ КОД: ОПТИМІЗАЦІЯ №1 ---
+        # Створюємо "білий список" символів, які можуть бути на українських номерах.
+        # Це значно прискорює роботу OCR та підвищує точність.
+        self.OCR_ALLOWLIST = 'ABCEHIKMOPTXYZ0123456789'
+        self._logger.info(f"Для OCR встановлено білий список символів: {self.OCR_ALLOWLIST}")
+        # --- КІНЕЦЬ НОВОГО КОДУ ---
 
         if self.vehicle_session:
             self.vehicle_input_name = self.vehicle_session.get_inputs()[0].name
@@ -55,7 +74,6 @@ class CVProcessor:
         self.roi_config = self._load_roi_config(roi_config_path)
         self._logger.info("CVProcessor успішно ініціалізовано.")
 
-    # --- ПОВНІСТЮ ПЕРЕПИСАНА ФУНКЦІЯ ФОРМАТУВАННЯ ТА ВАЛІДАЦІЇ ---
     def _format_plate_number(self, raw_text: str) -> Optional[str]:
         """
         Очищує, виправляє та валідує номерний знак.
@@ -65,8 +83,7 @@ class CVProcessor:
             return None
 
         # 1. Попередня очистка: видаляємо все, крім літер та цифр, переводимо у верхній регістр.
-        # Додаємо кириличні символи, схожі на латинські, для кращої очистки.
-        clean_text = re.sub(r'[^A-ZА-Я0-9]', '', raw_text.upper())
+        clean_text = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
 
         # 2. Перевірка довжини. Для стандарту AA1111AA довжина має бути 8.
         if len(clean_text) != 8:
@@ -78,17 +95,11 @@ class CVProcessor:
         digit_to_letter = {'0': 'O', '1': 'I', '8': 'B'}
         letter_to_digit = {'O': '0', 'I': '1', 'B': '8', 'A': '4'}
 
-        # Перші 2 символи мають бути літерами
-        for i in [0, 1]:
+        for i in [0, 1, 6, 7]:  # Позиції для літер
             if plate_chars[i].isdigit(): plate_chars[i] = digit_to_letter.get(plate_chars[i], plate_chars[i])
 
-        # Наступні 4 символи мають бути цифрами
-        for i in range(2, 6):
+        for i in range(2, 6):  # Позиції для цифр
             if plate_chars[i].isalpha(): plate_chars[i] = letter_to_digit.get(plate_chars[i], plate_chars[i])
-
-        # Останні 2 символи мають бути літерами
-        for i in [6, 7]:
-            if plate_chars[i].isdigit(): plate_chars[i] = digit_to_letter.get(plate_chars[i], plate_chars[i])
 
         corrected_plate = "".join(plate_chars)
 
@@ -103,15 +114,35 @@ class CVProcessor:
     def recognize_plate_characters(self, plate_image: np.ndarray) -> Optional[str]:
         """Розпізнає символи на зображенні номерного знака за допомогою EasyOCR."""
         try:
-            result = self.ocr_reader.readtext(plate_image, detail=0, paragraph=True)
+            # --- НОВИЙ КОД: ОПТИМІЗАЦІЯ №2 ---
+            # 1. Перетворюємо зображення в градації сірого. Колір для OCR не потрібен.
+            gray_plate = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
+
+            # 2. Застосовуємо CLAHE для адаптивного вирівнювання гістограми.
+            # Це значно покращує локальний контраст і робить символи чіткішими,
+            # особливо в умовах поганого освітлення.
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced_plate = clahe.apply(gray_plate)
+            # --- КІНЕЦЬ НОВОГО КОДУ ---
+
+            # Передаємо покращене зображення та "білий список" в OCR
+            result = self.ocr_reader.readtext(
+                enhanced_plate,
+                detail=0,
+                paragraph=True,
+                allowlist=self.OCR_ALLOWLIST # Використовуємо наш білий список
+            )
+
             if not result:
                 return None
+
+            # Об'єднуємо результат в один рядок, видаляючи пробіли
             return "".join(result).replace(" ", "").upper()
+
         except Exception as e:
             self._logger.error(f"Помилка під час роботи EasyOCR: {e}", exc_info=True)
             return None
 
-    # ... (решта методів залишаються без змін) ...
     def _load_onnx_model(self, model_path: str) -> Optional[onnxruntime.InferenceSession]:
         if not os.path.exists(model_path):
             self._logger.error(f"Файл моделі ONNX не знайдено: {model_path}")
@@ -156,20 +187,28 @@ class CVProcessor:
 
     def detect_vehicle_in_frame(self, image_bgr: np.ndarray, camera_type: str) -> List[Tuple[int, int, int, int]]:
         if not self.vehicle_session: return []
+
         input_tensor = self._preprocess_for_mobilenet(image_bgr)
         outputs = self.vehicle_session.run(None, {self.vehicle_input_name: input_tensor})
+
         all_detections = []
         boxes, classes, scores, _ = outputs[0], outputs[1], outputs[2], outputs[3]
         h, w = image_bgr.shape[:2]
+
         for i in range(len(scores[0])):
             class_id, score = int(classes[0][i]), scores[0][i]
             if score > self.vehicle_confidence_thresh and class_id in TARGET_VEHICLE_CLASS_IDS:
                 box = boxes[0][i]
                 y_min, x_min, y_max, x_max = int(box[0] * h), int(box[1] * w), int(box[2] * h), int(box[3] * w)
                 all_detections.append((x_min, y_min, x_max, y_max))
-        roi_key, roi_settings = f"{camera_type}_camera_roi", self.roi_config.get(f"{camera_type}_camera_roi")
-        if roi_settings and roi_settings.get("enabled", False):
+
+        # Фільтруємо знайдені автомобілі за зоною інтересу (ROI)
+        roi_key = f"{camera_type}_camera_roi"
+        roi_settings = self.roi_config.get(roi_key)
+
+        if roi_settings:
             return [bbox for bbox in all_detections if _check_bbox_roi_intersection(bbox, roi_settings)]
+
         return all_detections
 
     def detect_license_plate(self, vehicle_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
@@ -195,6 +234,7 @@ class CVProcessor:
             return None, None
 
         if save_intermediate_steps: save_image(vehicle_image, save_path_prefix, f"{timestamp}_1_vehicle_crop.jpg")
+
         plate_boxes = self.detect_license_plate(vehicle_image)
         if not plate_boxes:
             self._logger.info(f"[{cam_type.upper()}] Номерний знак не виявлено на автомобілі.")
@@ -205,15 +245,15 @@ class CVProcessor:
         x1, y1, x2, y2 = plate_box
         padding_x, padding_y = int((x2 - x1) * 0.05), int((y2 - y1) * 0.2)
         padded_plate_box = (max(0, x1 - padding_x), max(0, y1 - padding_y), min(w, x2 + padding_x), min(h, y2 + padding_y))
+
         plate_image = crop_image(vehicle_image, padded_plate_box)
         if plate_image is None or plate_image.size == 0:
             self._logger.warning("Зображення номерного знака порожнє після обрізки.")
             return None, None
+
         if save_intermediate_steps: save_image(plate_image, save_path_prefix, f"{timestamp}_2_plate_crop.jpg")
 
         raw_plate_text = self.recognize_plate_characters(plate_image)
-
-        # Тепер ця функція поверне None, якщо номер не валідний
         formatted_plate = self._format_plate_number(raw_plate_text)
 
         if formatted_plate:
