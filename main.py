@@ -14,6 +14,10 @@ from core.sheet_handler import SheetHandler
 from core.gate_controller import GateController
 from core.cv_processor import CVProcessor
 from core.vehicle_event_handler import VehicleEventHandler
+# --- ЗМІНА ---
+# Додаємо імпорт нового менеджера налаштувань
+from core.settings_manager import SettingsManager
+# --- КІНЕЦЬ ЗМІНИ ---
 
 # Опціональний імпорт нотифікатора
 try:
@@ -38,19 +42,19 @@ CLOSE_RELAY_PIN: int = 27
 
 # --- КОНФІГУРАЦІЯ TELEGRAM ---
 # Рекомендується зберігати ці дані у змінних середовища для безпеки
-TELEGRAM_BOT_TOKEN: Optional[str] = os.getenv("8392356130:AAHlCj5LFqKizWp17KKPTXetvjQiPq30i6U")
-TELEGRAM_CHAT_ID: Optional[str] = os.getenv("591969753")
+TELEGRAM_BOT_TOKEN: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- ШЛЯХИ ДО ФАЙЛІВ ТА URL ---
 CONFIG_DIR = "config"
 MODELS_DIR = "models"
-SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1gz5snNdG06sPL0_w2zyWtca3BiAQ7ru8I93LqPVjrC4/edit?gid=0#gid=0"
+# Переконайтеся, що SPREADSHEET_URL встановлено як змінна середовища або вказано тут
+SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "https://docs.google.com/spreadsheets/d/1gz5snNdG06sPL0_w2zyWtca3BiAQ7ru8I93LqPVjrC4/edit?gid=0#gid=0")
 CAPTURES_DIR = "captures" # Папка для збереження зображень з розпізнаними номерами
 ROI_CONFIG_PATH = os.path.join(CONFIG_DIR, "roi_config.json")
 SHEETS_CREDENTIALS_PATH = os.path.join(CONFIG_DIR, "credentials.json")
 MOBILENET_SSD_PATH = os.path.join(MODELS_DIR, "ssd_mobilenetv1.onnx")
 LICENSE_PLATE_MODEL_PATH = os.path.join(MODELS_DIR, "license.onnx")
-OCR_MODEL_PATH = os.path.join(MODELS_DIR, "ocr.pt")
 
 # --- КОНФІГУРАЦІЯ КАМЕР ---
 CAMERA_ENTRY_CONFIG: Dict[str, Any] = {"name": "EntryCamera", "resolution": (1280, 720)}
@@ -64,6 +68,7 @@ def main_application():
 
     # Створюємо папку для зображень, якщо її немає
     os.makedirs(CAPTURES_DIR, exist_ok=True)
+    os.makedirs(CONFIG_DIR, exist_ok=True)
 
     # Ініціалізуємо змінні як None на випадок помилки під час запуску
     cam_manager = None
@@ -72,7 +77,13 @@ def main_application():
     vehicle_event_hndl = None
 
     try:
-        # 1. Ініціалізація камер
+        # --- ЗМІНА ---
+        # 1. Ініціалізація менеджера налаштувань
+        logger.info("Ініціалізація SettingsManager...")
+        settings_mgr = SettingsManager()
+        # --- КІНЕЦЬ ЗМІНИ ---
+
+        # 2. Ініціалізація камер
         logger.info("Ініціалізація CameraManager...")
         cam_manager = CameraManager(
             entry_cam_model_sub='imx219',
@@ -81,9 +92,9 @@ def main_application():
             exit_cam_config=CAMERA_EXIT_CONFIG
         )
 
-        # 2. Ініціалізація Google Sheets
+        # 3. Ініціалізація Google Sheets
         logger.info("Ініціалізація SheetHandler...")
-        if not SPREADSHEET_URL:
+        if not SPREADSHEET_URL or "YOUR_SPREADSHEET_URL_HERE" in SPREADSHEET_URL:
             logger.critical("URL Google Таблиці не вказано! Встановіть змінну середовища SPREADSHEET_URL.")
             return
         sheet_hndl = SheetHandler(
@@ -91,7 +102,7 @@ def main_application():
             spreadsheet_url=SPREADSHEET_URL
         )
 
-        # 3. Ініціалізація комп'ютерного зору
+        # 4. Ініціалізація комп'ютерного зору
         logger.info("Ініціалізація CVProcessor...")
         cv_proc = CVProcessor(
             mobilenet_ssd_path=MOBILENET_SSD_PATH,
@@ -99,26 +110,30 @@ def main_application():
             roi_config_path=ROI_CONFIG_PATH
         )
 
-        # 4. Ініціалізація сенсорів
+        # 5. Ініціалізація сенсорів
         logger.info("Ініціалізація SensorManager...")
         sensor_mgr = SensorManager(reed_pin=REED_SWITCH_PIN)
 
-        # 5. Ініціалізація контролера воріт
+        # 6. Ініціалізація контролера воріт
         logger.info("Ініціалізація GateController...")
         gate_ctrl = GateController(
             open_relay_pin=OPEN_RELAY_PIN,
             close_relay_pin=CLOSE_RELAY_PIN
         )
 
-        # 6. Ініціалізація Telegram нотифікатора
+        # 7. Ініціалізація Telegram нотифікатора
         notifier = None
         if TelegramNotifier and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             logger.info("Ініціалізація TelegramNotifier...")
-            notifier = TelegramNotifier(token=TELEGRAM_BOT_TOKEN, chat_id=int(TELEGRAM_CHAT_ID))
+            try:
+                chat_id_int = int(TELEGRAM_CHAT_ID)
+                notifier = TelegramNotifier(token=TELEGRAM_BOT_TOKEN, chat_id=chat_id_int)
+            except (ValueError, TypeError):
+                 logger.error(f"Некоректний TELEGRAM_CHAT_ID: '{TELEGRAM_CHAT_ID}'. Має бути число.")
         else:
             logger.warning("Токен/ID чату для Telegram не вказано або модуль не знайдено. Сповіщення вимкнено.")
 
-        # 7. Ініціалізація головного обробника логіки
+        # 8. Ініціалізація головного обробника логіки
         logger.info("Ініціалізація VehicleEventHandler...")
         vehicle_event_hndl = VehicleEventHandler(
             camera_entry=cam_manager.get_entry_camera(),
@@ -128,10 +143,13 @@ def main_application():
             cv_processor=cv_proc,
             gate_controller=gate_ctrl,
             config=VEH_CONFIG,
-            notifier=notifier  # Передаємо нотифікатор
+            notifier=notifier,
+            # --- ЗМІНА ---
+            settings_manager=settings_mgr  # Передаємо менеджер налаштувань
+            # --- КІНЕЦЬ ЗМІНИ ---
         )
 
-        # 8. Налаштування коректного завершення роботи
+        # 9. Налаштування коректного завершення роботи
         shutdown_event = threading.Event()
         def signal_handler(sig, frame):
             logger.warning(f"Отримано сигнал {signal.Signals(sig).name}. Завершення роботи...")
@@ -140,7 +158,7 @@ def main_application():
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        # 9. Запуск системи
+        # 10. Запуск системи
         vehicle_event_hndl.start(shutdown_event)
         logger.info("Система запущена. Натисніть Ctrl+C для завершення.")
         shutdown_event.wait()  # Очікуємо на сигнал Ctrl+C
@@ -148,7 +166,7 @@ def main_application():
     except Exception as e:
         logger.critical(f"Неперехоплена помилка в main_application: {e}", exc_info=True)
     finally:
-        # 10. Коректне звільнення ресурсів
+        # 11. Коректне звільнення ресурсів
         logger.info("Початок процедури коректного завершення роботи...")
         if vehicle_event_hndl:
             vehicle_event_hndl.stop()
